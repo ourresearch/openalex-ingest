@@ -13,6 +13,12 @@ CROSSREF_API_KEY = os.getenv('CROSSREF_API_KEY')
 
 logging = logging.getLogger(__name__)
 
+"""
+Run with: heroku local:run python crossref.py new
+
+Download monthly snapshot to ec2: curl -H 'crossref-api-key: mykey' -H 'User-Agent: Downloader/1.1 (mailto:dev@ourresearch.org)' -v -L -o all.json.tar.gz -X GET https://api.crossref.org/snapshots/monthly/latest/all.json.tar.gz
+"""
+
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10),
        retry=retry_if_exception_type(requests.exceptions.RequestException))
