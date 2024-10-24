@@ -94,7 +94,7 @@ def main():
     parser.add_argument('mode', choices=['new', 'updates_two_days_ago', 'updates'], help='Specify whether to pull new works or updates.')
     args = parser.parse_args()
 
-    s3_bucket = 'openalex-sandbox'
+    s3_bucket = 'openalex-ingest'
     now = datetime.datetime.now(datetime.timezone.utc)
     today_str = now.strftime('%Y-%m-%d')
     yesterday = now - datetime.timedelta(days=1)
@@ -104,12 +104,12 @@ def main():
 
     if args.mode == 'new':
         filter_params = f'from-created-date:{yesterday_str},until-created-date:{today_str}'
-        s3_prefix = f'openalex-ingest/crossref/new-works/{now.strftime("%Y/%m/%d/%H")}'
+        s3_prefix = f'crossref/new-works/{now.strftime("%Y/%m/%d/%H")}'
         get_crossref_data(filter_params, s3_bucket, s3_prefix)
 
     elif args.mode == 'updates':
         filter_params = f'from-index-date:{two_days_ago_str},until-index-date:{yesterday_str}'
-        s3_prefix = f'openalex-ingest/crossref/updates/{yesterday.strftime("%Y/%m/%d")}'
+        s3_prefix = f'crossref/updates/{yesterday.strftime("%Y/%m/%d")}'
         get_crossref_data(filter_params, s3_bucket, s3_prefix)
 
 
