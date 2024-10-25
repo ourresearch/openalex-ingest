@@ -87,11 +87,12 @@ def get_crossref_data(filter_params, s3_bucket, s3_prefix):
 def save_to_s3(json_data, s3_bucket, s3_key):
     LOGGER.info(f"Saving crossref works to S3 bucket {s3_bucket} with key {s3_key}.")
     s3 = boto3.client('s3')
+    data_to_save = {'items': json_data}  # same format as crossref snapshot
     s3.put_object(
         Bucket=s3_bucket,
         Key=s3_key,
-        Body=json.dumps(json_data),
-        ContentType='application/json'
+        Body=json.dumps(data_to_save, indent=2),
+        ContentType='application/json; charset=utf-8'
     )
 
 
