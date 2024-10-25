@@ -52,16 +52,13 @@ def main():
         raise
 
     logging.info(f"downloading and unzipping ROR data from {file_url}")
-    print(f"downloading and unzipping ROR data from {file_url}")
     ror_data, fname = download_and_unzip_ror_data(file_url)
     if not ror_data:
         raise RuntimeError(
             "Failed to download and unzip ROR data! Exiting without doing any updates..."
         )
 
-    print('trying S3')
     files_in_s3 = get_file_list_s3_bucket(ror_bucket, "ror/snapshots")
-    print(files_in_s3)
 
     if f"{fname}.parquet" in files_in_s3:
         logging.info(f"Most recent ROR snapshot already saved. Exiting without saving snapshot...")
