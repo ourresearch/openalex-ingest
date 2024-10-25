@@ -1,3 +1,7 @@
 boto3==1.35.47
 requests==2.32.3
 tenacity==9.0.0
+pandas==2.0.3
+pyarrow==7.0.0
+s3fs==2022.2.0
+fsspec==2024.2.0
