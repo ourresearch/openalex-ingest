@@ -60,7 +60,7 @@ def main():
 
     files_in_s3 = get_file_list_s3_bucket(ror_bucket, "ror/snapshots")
 
-    if f"{fname}.parquet" in files_in_s3:
+    if f"ror/snapshots/{fname}.parquet" in files_in_s3:
         logging.info(f"Most recent ROR snapshot already saved. Exiting without saving snapshot...")
         return
     
