@@ -36,7 +36,7 @@ def get_file_list_s3_bucket(bucket_name, prefix):
     bucket = s3.Bucket(bucket_name)
     return [obj.key for obj in bucket.objects.filter(Prefix=prefix) if obj.key.endswith(".parquet")]
 
-def main(args):
+def main():
     ror_bucket = "openalex-ingest"
 
     most_recent_file_obj = get_most_recent_ror_dump_metadata()
