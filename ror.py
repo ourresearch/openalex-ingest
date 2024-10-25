@@ -39,7 +39,11 @@ def get_file_list_s3_bucket(bucket_name, prefix):
 def main():
     ror_bucket = "openalex-ingest"
 
+    print("beginning")
+
     most_recent_file_obj = get_most_recent_ror_dump_metadata()
+
+    print("got most recent file")
     if most_recent_file_obj is None:
         logging.info("Failed to get ROR data. Exiting without doing any updates...")
         return
@@ -51,6 +55,7 @@ def main():
         raise
 
     logging.info(f"downloading and unzipping ROR data from {file_url}")
+    print("downloading and unzipping ROR data from {file_url}")
     ror_data, fname = download_and_unzip_ror_data(file_url)
     if not ror_data:
         raise RuntimeError(
@@ -58,6 +63,7 @@ def main():
         )
 
     files_in_s3 = get_file_list_s3_bucket(ror_bucket, "ror/snapshots")
+    print(files_in_s3)
 
     if f"{fname}.parquet" in files_in_s3:
         logging.info(f"Most recent ROR snapshot already saved. Exiting without saving snapshot...")
