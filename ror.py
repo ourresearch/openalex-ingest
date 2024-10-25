@@ -67,3 +67,6 @@ def main(args):
     pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror_snapshots/{fname}.parquet")
     pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror_current/ror_snapshot.parquet")
     logging.info(f"Saved snapshots!")
+
+if __name__ == '__main__':
+    main()
