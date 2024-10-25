@@ -57,15 +57,15 @@ def main():
             "Failed to download and unzip ROR data! Exiting without doing any updates..."
         )
 
-    files_in_s3 = get_file_list_s3_bucket(ror_bucket, "ror_snapshots")
+    files_in_s3 = get_file_list_s3_bucket(ror_bucket, "ror/snapshots")
 
     if f"{fname}.parquet" in files_in_s3:
         logging.info(f"Most recent ROR snapshot already saved. Exiting without saving snapshot...")
         return
     
     logging.info(f"Saving snapshot for {len(ror_data)} ROR records")
-    pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror_snapshots/{fname}.parquet")
-    pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror_current/ror_snapshot.parquet")
+    pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror/snapshots/{fname}.parquet")
+    pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror/current/ror_snapshot.parquet")
     logging.info(f"Saved snapshots!")
 
 if __name__ == '__main__':

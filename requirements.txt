@@ -1,4 +1,5 @@
 boto3==1.35.47
 requests==2.32.3
 tenacity==9.0.0
-pandas
+pandas==2.2.3
+pyarrow==17.0.0
