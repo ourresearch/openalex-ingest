@@ -1,7 +1,4 @@
 boto3==1.35.47
 requests==2.32.3
 tenacity==9.0.0
-pandas==2.0.3
-pyarrow>=14.0.1
-s3fs
-fsspec
+pandas
