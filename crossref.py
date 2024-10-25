@@ -1,7 +1,6 @@
 import argparse
 import datetime
 import json
-import logging
 import os
 import time
 
@@ -9,9 +8,10 @@ import boto3
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from common import S3_BUCKET, LOGGER
+
 CROSSREF_API_KEY = os.getenv('CROSSREF_API_KEY')
 
-logging = logging.getLogger(__name__)
 
 """
 Run with: heroku local:run python crossref.py new
@@ -27,12 +27,12 @@ def make_request_with_retry(url, headers):
 
     if response.status_code == 429:
         retry_after = int(response.headers.get('Retry-After', 60))
-        logging.warning(f"Rate limit exceeded (429). Retrying after {retry_after} seconds.")
+        LOGGER.warning(f"Rate limit exceeded (429). Retrying after {retry_after} seconds.")
         time.sleep(retry_after)
         response.raise_for_status()
 
     elif response.status_code >= 500:
-        logging.error(f"Server error {response.status_code} for URL {url}. Retrying...")
+        LOGGER.error(f"Server error {response.status_code} for URL {url}. Retrying...")
         response.raise_for_status()
 
     return response
@@ -61,7 +61,7 @@ def get_crossref_data(filter_params, s3_bucket, s3_prefix):
 
         response = make_request_with_retry(url, headers)
 
-        logging.info(f"Requesting page {page_number} from URL {url}.")
+        LOGGER.info(f"Requesting page {page_number} from URL {url}.")
 
         data = response.json()
         items = data['message']['items']
@@ -71,11 +71,11 @@ def get_crossref_data(filter_params, s3_bucket, s3_prefix):
             s3_key = f'{s3_prefix}/works_page_{page_number}_{current_timestamp}.json'
             save_to_s3(items, s3_bucket, s3_key)
         else:
-            logging.info(f"No more items to fetch on page {page_number}. Ending pagination.")
+            LOGGER.info(f"No more items to fetch on page {page_number}. Ending pagination.")
             has_more_pages = False
 
         if 'next-cursor' not in data['message']:
-            logging.info("No next cursor found, pagination complete.")
+            LOGGER.info("No next cursor found, pagination complete.")
             has_more_pages = False
 
         cursor = data['message']['next-cursor']
@@ -85,7 +85,7 @@ def get_crossref_data(filter_params, s3_bucket, s3_prefix):
 
 
 def save_to_s3(json_data, s3_bucket, s3_key):
-    logging.info(f"Saving crossref works to S3 bucket {s3_bucket} with key {s3_key}.")
+    LOGGER.info(f"Saving crossref works to S3 bucket {s3_bucket} with key {s3_key}.")
     s3 = boto3.client('s3')
     s3.put_object(
         Bucket=s3_bucket,
@@ -100,7 +100,6 @@ def main():
     parser.add_argument('mode', choices=['new', 'updates_two_days_ago', 'updates'], help='Specify whether to pull new works or updates.')
     args = parser.parse_args()
 
-    s3_bucket = 'openalex-ingest'
     now = datetime.datetime.now(datetime.timezone.utc)
     today_str = now.strftime('%Y-%m-%d')
     yesterday = now - datetime.timedelta(days=1)
@@ -111,12 +110,12 @@ def main():
     if args.mode == 'new':
         filter_params = f'from-created-date:{yesterday_str},until-created-date:{today_str}'
         s3_prefix = f'crossref/new-works/{now.strftime("%Y/%m/%d/%H")}'
-        get_crossref_data(filter_params, s3_bucket, s3_prefix)
+        get_crossref_data(filter_params, S3_BUCKET, s3_prefix)
 
     elif args.mode == 'updates':
         filter_params = f'from-index-date:{two_days_ago_str},until-index-date:{yesterday_str}'
         s3_prefix = f'crossref/updates/{yesterday.strftime("%Y/%m/%d")}'
-        get_crossref_data(filter_params, s3_bucket, s3_prefix)
+        get_crossref_data(filter_params, S3_BUCKET, s3_prefix)
 
 
 if __name__ == '__main__':
