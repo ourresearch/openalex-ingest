@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 from common import S3_BUCKET, LOGGER
 
-BATCH_SIZE = 1000
+BATCH_SIZE = 5000
 
 
 def get_datetime_path(updated):
