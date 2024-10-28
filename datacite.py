@@ -39,7 +39,7 @@ def upload_batch_api(batch_number, works, s3_client):
 
 def upload_batch_datafile(batch_number, works, s3_client):
     try:
-        object_key = f"datacite/datafile_2023_works/{batch_number * BATCH_SIZE}.json"
+        object_key = f"datacite/snapshot-2023-12-31/{batch_number * BATCH_SIZE}.json"
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
@@ -193,7 +193,7 @@ def harvest_works(works_iterator, num_threads, doi_getter):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--threads', type=int, default=20)
-    parser.add_argument('--from-date', default='2023-12-01')
+    parser.add_argument('--from-date', default='2024-01-01')
     parser.add_argument('--update', action='store_true')
     parser.add_argument('--source', choices=['api', 'datafile'], default='api')
     args = parser.parse_args()
