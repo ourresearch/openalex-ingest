@@ -11,7 +11,6 @@ from common import S3_BUCKET, LOGGER
 def pubmed_ftp_client():
     ftp = FTP('ftp.ncbi.nlm.nih.gov')
     ftp.login()
-    ftp.cwd('/pubmed/updatefiles/')
     return ftp
 
 def retrieve_file(ftp_client, filename):
@@ -50,7 +49,11 @@ def main():
     s3 = boto3.client('s3')
     existing_fnames = get_existing_fnames(s3)
     ftp = pubmed_ftp_client()
-    remote_filenames = sorted([f for f in ftp.nlst() if f.endswith('.xml.gz')])
+    ftp.cwd('/pubmed/baseline')
+    baseline_fnames = [f'/pubmed/baseline/{f}' for f in ftp.nlst() if f.endswith('.xml.gz')]
+    ftp.cwd('/pubmed/updatefiles')
+    update_fnames = [f'/pubmed/updatefiles/{f}' for f in ftp.nlst() if f.endswith('.xml.gz')]
+    remote_filenames = sorted(baseline_fnames + update_fnames)
     ftp.quit()
     for i, filename in enumerate([f for f in remote_filenames if f not in existing_fnames]):
         LOGGER.info(f'Fetching {filename} ({i + 1}/{len(remote_filenames)})')
