@@ -89,7 +89,7 @@ def download_worker(q, tracker, total_files):
             LOGGER.info(f'Starting {filename} ({i + 1}/{total_files})')
             ftp = pubmed_ftp_client()
             temp_fname = retrieve_file(ftp, filename)
-            s3.upload_file(temp_fname, S3_BUCKET, 'pubmed/' + filename)
+            s3.upload_file(temp_fname, S3_BUCKET, 'pubmed/' + filename.split('/')[-1])
             ftp.quit()
             tracker.increment()
             LOGGER.info(f'Finished {filename} ({i + 1}/{total_files})')
