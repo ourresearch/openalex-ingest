@@ -39,7 +39,7 @@ def upload_batch_api(batch_number, works, s3_client):
 
 def upload_batch_datafile(batch_number, works, s3_client):
     try:
-        object_key = f"datacite/snapshot-2023-12-31/{batch_number * BATCH_SIZE}.json"
+        object_key = f"datacite/snapshot-2023-12-31/{batch_number}.json"
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
