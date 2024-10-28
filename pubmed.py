@@ -64,7 +64,7 @@ def get_existing_fnames(s3):
     for o in obj_list["Contents"]:
         existing_fnames.add(o['Key'])
     if 'NextToken' not in obj_list or not obj_list['NextToken']:
-        return existing_fnames
+        return [fname.split('/')[-1] for fname in existing_fnames]
     while True:
         obj_list = s3.list_objects_v2(Bucket=S3_BUCKET,
                                       Prefix='pubmed',
@@ -74,7 +74,7 @@ def get_existing_fnames(s3):
             existing_fnames.add(o['Key'])
         if 'NextToken' not in obj_list or not obj_list['NextToken']:
             break
-    return existing_fnames
+    return [fname.split('/')[-1] for fname in existing_fnames]
 
 
 def download_worker(q, tracker, total_files):
@@ -113,7 +113,7 @@ def main(num_threads):
     remote_filenames = sorted(baseline_fnames + update_fnames)
     ftp.quit()
 
-    files_to_process = [f for f in remote_filenames if f not in existing_fnames]
+    files_to_process = [f for f in remote_filenames if f.split('/')[-1] not in existing_fnames]
     total_files = len(files_to_process)
 
     if not files_to_process:
