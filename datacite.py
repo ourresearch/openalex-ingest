@@ -11,6 +11,26 @@ from datetime import datetime, timedelta
 
 from common import S3_BUCKET, LOGGER
 
+BATCH_SIZE = 1000
+
+
+def upload_batch(batch_number, works, s3_client):
+    try:
+        start_id = (batch_number * BATCH_SIZE) + 1
+        end_id = start_id + len(works) - 1
+
+        object_key = f"datacite/works/{start_id}-{end_id}.json"
+
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=object_key,
+            Body=json.dumps(works),
+            ContentType='application/json'
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error uploading batch {batch_number}: {e}")
+
 
 def upload_worker(q):
     s3 = boto3.client('s3')
@@ -20,17 +40,10 @@ def upload_worker(q):
             break
 
         try:
-            identifier, json_content = item
-            object_key = f"datacite/works/{quote(identifier, safe='')}.json"
-
-            s3.put_object(
-                Bucket=S3_BUCKET,
-                Key=object_key,
-                Body=json.dumps(json_content),
-                ContentType='application/json'
-            )
+            batch_number, works = item
+            upload_batch(batch_number, works, s3)
         except Exception as e:
-            LOGGER.error(f"Error uploading {identifier}: {e}")
+            LOGGER.error(f"Error in upload worker: {e}")
 
         q.task_done()
 
@@ -107,21 +120,32 @@ def harvest_works(works_iterator, num_threads, doi_getter):
 
     count = 0
     start_time = time.time()
+    current_batch = []
+    batch_number = 0
 
     try:
         for work in works_iterator():
             try:
                 doi = doi_getter(work)
-                upload_queue.put((doi, work))
-
+                current_batch.append(work)
                 count += 1
+
+                if len(current_batch) >= BATCH_SIZE:
+                    upload_queue.put((batch_number, current_batch))
+                    batch_number += 1
+                    current_batch = []
+
                 if count % 100 == 0:
                     elapsed_hours = (time.time() - start_time) / 3600
                     rate_per_hour = count / elapsed_hours
                     LOGGER.info(
                         f"Fetched {count} DataCite works. Rate: {rate_per_hour:.0f}/hour")
+
             except Exception as e:
-                LOGGER.error(f"Error extracting DOI from work: {e}")
+                LOGGER.error(f"Error processing work: {e}")
+
+        if current_batch:
+            upload_queue.put((batch_number, current_batch))
 
     except Exception as e:
         LOGGER.error(f"Error processing works: {e}")
@@ -138,13 +162,13 @@ def harvest_works(works_iterator, num_threads, doi_getter):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--threads', type=int, default=20,
-                       help='Number of upload threads')
+                        help='Number of upload threads')
     parser.add_argument('--from-date', default='2023-12-01',
-                       help='Fetch works updated since this date (YYYY-MM-DD)')
+                        help='Fetch works updated since this date (YYYY-MM-DD)')
     parser.add_argument('--update', action='store_true',
-                       help='Only fetch works updated in the last 24 hours')
+                        help='Only fetch works updated in the last 24 hours')
     parser.add_argument('--source', choices=['api', 'datafile'], default='api',
-                       help='Source of works (API or datafile)')
+                        help='Source of works (API or datafile)')
     args = parser.parse_args()
 
     if args.source == 'api':
