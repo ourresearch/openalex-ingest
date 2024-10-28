@@ -1,5 +1,6 @@
 from urllib.parse import quote
 import boto3
+import requests
 from sickle import Sickle
 from queue import Queue
 import threading
@@ -8,6 +9,9 @@ import time
 import gzip
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
+
+from tenacity import retry, retry_if_exception_type, wait_exponential, \
+    stop_after_attempt
 
 from common import S3_BUCKET, LOGGER
 
@@ -63,6 +67,63 @@ def upload_worker(q):
         q.task_done()
 
 
+def should_retry_exception(exception):
+    retry_exceptions = (
+        requests.exceptions.RequestException,
+        requests.exceptions.HTTPError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout
+    )
+    return isinstance(exception, retry_exceptions)
+
+
+@retry(
+    retry=retry_if_exception_type(should_retry_exception),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(3),
+    before_sleep=lambda retry_state: LOGGER.info(
+        f"Retrying after error: {retry_state.outcome.exception()}. Attempt {retry_state.attempt_number}")
+)
+def fetch_and_process_records(sickle, kwargs, record_type, upload_queue):
+    records = sickle.ListRecords(**kwargs)
+    count = 0
+    start_time = time.time()
+    current_batch = []
+    current_batch_first_record = None
+    current_date_path = None
+    batch_number = 0
+
+    for record in records:
+        new_date_path = get_datetime_path(record)
+        if new_date_path != current_date_path:
+            current_date_path = new_date_path
+            batch_number = 0
+
+        if not current_batch_first_record:
+            current_batch_first_record = record
+        current_batch.append(record.raw)
+        count += 1
+
+        if len(current_batch) >= BATCH_SIZE:
+            upload_queue.put((record_type, batch_number, current_batch,
+                              current_batch_first_record))
+            batch_number += 1
+            current_batch = []
+            current_batch_first_record = None
+
+        if count % 100 == 0:
+            elapsed_hours = (time.time() - start_time) / 3600
+            rate_per_hour = count / elapsed_hours
+            LOGGER.info(
+                f"Fetched {count} DOAJ {record_type}. Rate: {rate_per_hour:.0f}/hour")
+
+    if current_batch:
+        upload_queue.put((record_type, batch_number, current_batch,
+                          current_batch_first_record))
+
+    return count
+
+
 def harvest_records(record_type, num_threads, update_mode=False):
     base_url = "https://www.doaj.org/oai.article" if record_type == "articles" else "https://www.doaj.org/oai"
     sickle = Sickle(base_url)
@@ -74,53 +135,15 @@ def harvest_records(record_type, num_threads, update_mode=False):
         LOGGER.info(
             f"Running in update mode. Fetching {record_type} updated since {yesterday}")
 
-    records = sickle.ListRecords(**kwargs)
     upload_queue = Queue()
-
     workers = []
     for _ in range(num_threads):
         t = threading.Thread(target=upload_worker, args=(upload_queue,))
         t.start()
         workers.append(t)
 
-    count = 0
-    start_time = time.time()
-    current_batch = []
-    current_batch_first_record = None
-    current_date_path = None
-    batch_number = 0
-
     try:
-        for record in records:
-            new_date_path = get_datetime_path(record)
-            if new_date_path != current_date_path:
-                current_date_path = new_date_path
-                batch_number = 0
-
-            if not current_batch_first_record:
-                current_batch_first_record = record
-            current_batch.append(record.raw)
-            count += 1
-
-            if len(current_batch) >= BATCH_SIZE:
-                upload_queue.put((record_type, batch_number, current_batch,
-                                  current_batch_first_record))
-                batch_number += 1
-                current_batch = []
-                current_batch_first_record = None
-
-            if count % 100 == 0:
-                elapsed_hours = (time.time() - start_time) / 3600
-                rate_per_hour = count / elapsed_hours
-                LOGGER.info(
-                    f"Fetched {count} DOAJ {record_type}. Rate: {rate_per_hour:.0f}/hour")
-
-        if current_batch:
-            upload_queue.put((record_type, batch_number, current_batch,
-                              current_batch_first_record))
-
-    except Exception as e:
-        LOGGER.error(f"Error fetching records: {e}")
+        count = fetch_and_process_records(sickle, kwargs, record_type, upload_queue)
     finally:
         for _ in workers:
             upload_queue.put(None)
