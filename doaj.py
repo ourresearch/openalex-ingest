@@ -30,8 +30,9 @@ def upload_batch(record_type, batch_number, records, first_record, s3_client):
 
         xml_content = ET.tostring(root, encoding='unicode', method='xml')
         compressed_content = gzip.compress(xml_content.encode('utf-8'))
+        timestamp = int(datetime.fromisoformat(first_record.header.datestamp.replace('Z', '+00:00')).timestamp())
 
-        object_key = f"doaj/{record_type}/{date_path}/{record_type}_page_{batch_number}_{int(time.time())}.xml.gz"
+        object_key = f"doaj/{record_type}/{date_path}/{record_type}_page_{batch_number}_{timestamp}.xml.gz"
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
