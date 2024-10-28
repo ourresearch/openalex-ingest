@@ -5,8 +5,37 @@ import boto3
 from queue import Queue
 import threading
 import argparse
+import time
 
 from common import S3_BUCKET, LOGGER
+
+
+class ProgressTracker:
+    def __init__(self, total_files):
+        self.total_files = total_files
+        self.completed_files = 0
+        self.lock = threading.Lock()
+
+    def increment(self):
+        with self.lock:
+            self.completed_files += 1
+
+    def get_stats(self):
+        with self.lock:
+            return self.completed_files, self.total_files
+
+
+def progress_logger(tracker, stop_event):
+    start_time = time.time()
+    while not stop_event.is_set():
+        completed, total = tracker.get_stats()
+        elapsed_hours = (time.time() - start_time) / 3600
+        rate_per_hour = completed / elapsed_hours if elapsed_hours > 0 else 0
+        percent_complete = (completed / total * 100) if total > 0 else 0
+
+        LOGGER.info(
+            f"Progress: {completed}/{total} files ({percent_complete:.1f}%) | Rate: {rate_per_hour:.0f} files/hour")
+        time.sleep(5)
 
 
 def pubmed_ftp_client():
@@ -48,7 +77,7 @@ def get_existing_fnames(s3):
     return existing_fnames
 
 
-def download_worker(q, total_files):
+def download_worker(q, tracker, total_files):
     s3 = boto3.client('s3')
     while True:
         item = q.get()
@@ -57,11 +86,12 @@ def download_worker(q, total_files):
 
         i, filename = item
         try:
-            LOGGER.info(f'Fetching {filename} ({i + 1}/{total_files})')
+            LOGGER.info(f'Starting {filename} ({i + 1}/{total_files})')
             ftp = pubmed_ftp_client()
             temp_fname = retrieve_file(ftp, filename)
             s3.upload_file(temp_fname, S3_BUCKET, 'pubmed/' + filename)
             ftp.quit()
+            tracker.increment()
             LOGGER.info(f'Finished {filename} ({i + 1}/{total_files})')
         except Exception as e:
             LOGGER.error(f"Error processing {filename}: {e}")
@@ -90,12 +120,21 @@ def main(num_threads):
         LOGGER.info("No new files to process")
         return
 
+    tracker = ProgressTracker(total_files)
+    stop_event = threading.Event()
+
+    progress_thread = threading.Thread(
+        target=progress_logger,
+        args=(tracker, stop_event)
+    )
+    progress_thread.start()
+
     download_queue = Queue()
     workers = []
 
     for _ in range(num_threads):
         t = threading.Thread(target=download_worker,
-                             args=(download_queue, total_files))
+                             args=(download_queue, tracker, total_files))
         t.start()
         workers.append(t)
 
@@ -108,7 +147,11 @@ def main(num_threads):
     for w in workers:
         w.join()
 
-    LOGGER.info(f"Completed processing {total_files} files")
+    stop_event.set()
+    progress_thread.join()
+
+    completed, total = tracker.get_stats()
+    LOGGER.info(f"Completed processing {completed}/{total} files")
 
 
 if __name__ == '__main__':
