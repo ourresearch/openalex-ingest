@@ -23,7 +23,8 @@ def upload_batch_api(batch_number, works, s3_client):
         first_work = works[0]
         updated = first_work['attributes']['updated']
         date_path = get_datetime_path(updated)
-        object_key = f"datacite/works/{date_path}/works_page_{batch_number}_{int(time.time())}.json"
+        timestamp = int(datetime.fromisoformat(updated.replace('Z', '+00:00')).timestamp())
+        object_key = f"datacite/works/{date_path}/works_page_{batch_number}_{timestamp}.json"
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
@@ -131,9 +132,8 @@ def datafile_works_iterator():
             LOGGER.error(f"Error processing chunk: {e}")
 
 
-def harvest_works(works_iterator, num_threads, doi_getter, is_api):
+def harvest_works(works_iterator, num_threads, doi_getter):
     upload_queue = Queue()
-
     workers = []
     for _ in range(num_threads):
         t = threading.Thread(target=upload_worker, args=(upload_queue, is_api))
@@ -143,12 +143,21 @@ def harvest_works(works_iterator, num_threads, doi_getter, is_api):
     count = 0
     start_time = time.time()
     current_batch = []
+    current_date_path = None
     batch_number = 0
 
     try:
         for work in works_iterator():
             try:
                 doi = doi_getter(work)
+
+                if 'attributes' in work:
+                    updated = work['attributes']['updated']
+                    new_date_path = get_datetime_path(updated)
+                    if new_date_path != current_date_path:
+                        current_date_path = new_date_path
+                        batch_number = 0
+
                 current_batch.append(work)
                 count += 1
 
@@ -206,4 +215,4 @@ if __name__ == "__main__":
         doi_getter = lambda work: work['doi']
         is_api = False
 
-    harvest_works(works_iterator, args.threads, doi_getter, is_api)
+    harvest_works(works_iterator, args.threads, doi_getter)

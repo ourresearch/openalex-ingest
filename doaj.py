@@ -86,10 +86,16 @@ def harvest_records(record_type, num_threads, update_mode=False):
     start_time = time.time()
     current_batch = []
     current_batch_first_record = None
+    current_date_path = None
     batch_number = 0
 
     try:
         for record in records:
+            new_date_path = get_datetime_path(record)
+            if new_date_path != current_date_path:
+                current_date_path = new_date_path
+                batch_number = 0
+
             if not current_batch_first_record:
                 current_batch_first_record = record
             current_batch.append(record.raw)
