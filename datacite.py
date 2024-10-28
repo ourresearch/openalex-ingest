@@ -1,3 +1,4 @@
+import gzip
 from urllib.parse import quote
 import boto3
 import requests
@@ -60,7 +61,42 @@ def fetch_works(from_date):
         page += 1
 
 
-def harvest_works(from_date, num_threads):
+def datafile_works_iterator():
+    s3 = boto3.client('s3')
+    datafile_path = 'datacite/datafile_2023'
+
+    response = s3.get_object(Bucket=S3_BUCKET, Key=datafile_path)
+    stream = response['Body']
+
+    decompressor = gzip.GzipFile(fileobj=stream)
+
+    buffer = ''
+
+    while True:
+        try:
+            chunk = decompressor.read(1024 * 1024).decode('utf-8')
+            if not chunk:
+                if buffer:
+                    try:
+                        yield json.loads(buffer)
+                    except json.JSONDecodeError as e:
+                        LOGGER.error(f"Error parsing JSON from buffer: {e}")
+                break
+
+            lines = (buffer + chunk).split('\n')
+            buffer = lines[-1]
+
+            for line in lines[:-1]:
+                if line.strip():
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError as e:
+                        LOGGER.error(f"Error parsing JSON line: {e}")
+        except Exception as e:
+            LOGGER.error(f"Error processing chunk: {e}")
+
+
+def harvest_works(works_iterator, num_threads, doi_getter):
     upload_queue = Queue()
 
     workers = []
@@ -73,19 +109,22 @@ def harvest_works(from_date, num_threads):
     start_time = time.time()
 
     try:
-        for work in fetch_works(from_date):
-            doi = work['attributes']['doi']
-            upload_queue.put((doi, work))
+        for work in works_iterator():
+            try:
+                doi = doi_getter(work)
+                upload_queue.put((doi, work))
 
-            count += 1
-            if count % 100 == 0:
-                elapsed_hours = (time.time() - start_time) / 3600
-                rate_per_hour = count / elapsed_hours
-                LOGGER.info(
-                    f"Fetched {count} DataCite works. Rate: {rate_per_hour:.0f}/hour")
+                count += 1
+                if count % 100 == 0:
+                    elapsed_hours = (time.time() - start_time) / 3600
+                    rate_per_hour = count / elapsed_hours
+                    LOGGER.info(
+                        f"Fetched {count} DataCite works. Rate: {rate_per_hour:.0f}/hour")
+            except Exception as e:
+                LOGGER.error(f"Error extracting DOI from work: {e}")
 
     except Exception as e:
-        LOGGER.error(f"Error fetching works: {e}")
+        LOGGER.error(f"Error processing works: {e}")
     finally:
         for _ in workers:
             upload_queue.put(None)
@@ -99,18 +138,28 @@ def harvest_works(from_date, num_threads):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--threads', type=int, default=20,
-                        help='Number of upload threads')
+                       help='Number of upload threads')
     parser.add_argument('--from-date', default='2023-12-01',
-                        help='Fetch works updated since this date (YYYY-MM-DD)')
+                       help='Fetch works updated since this date (YYYY-MM-DD)')
     parser.add_argument('--update', action='store_true',
-                        help='Only fetch works updated/created since yesterday')
+                       help='Only fetch works updated in the last 24 hours')
+    parser.add_argument('--source', choices=['api', 'datafile'], default='api',
+                       help='Source of works (API or datafile)')
     args = parser.parse_args()
 
-    if args.update:
-        from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        LOGGER.info(
-            f"Running in update mode. Fetching works updated since {from_date}")
-    else:
-        from_date = args.from_date
+    if args.source == 'api':
+        if args.update:
+            from_date = (datetime.now() - timedelta(days=1)).strftime(
+                '%Y-%m-%d')
+            LOGGER.info(
+                f"Running in update mode. Fetching works updated since {from_date}")
+        else:
+            from_date = args.from_date
 
-    harvest_works(from_date, args.threads)
+        works_iterator = lambda: fetch_works(from_date)
+        doi_getter = lambda work: work['attributes']['doi']
+    else:
+        works_iterator = datafile_works_iterator
+        doi_getter = lambda work: work['doi']
+
+    harvest_works(works_iterator, args.threads, doi_getter)
