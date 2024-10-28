@@ -14,21 +14,24 @@ from common import S3_BUCKET, LOGGER
 BATCH_SIZE = 1000
 
 
-def upload_batch(record_type, batch_number, records, s3_client):
-    try:
-        start_id = (batch_number * BATCH_SIZE) + 1
-        end_id = start_id + len(records) - 1
+def get_datetime_path(record):
+    datestamp = record.header.datestamp
+    dt = datetime.fromisoformat(datestamp.replace('Z', '+00:00'))
+    return f"{dt.year}/{dt.month:02d}/{dt.day:02d}/{dt.hour:02d}"
 
+
+def upload_batch(record_type, batch_number, records, first_record, s3_client):
+    try:
+        date_path = get_datetime_path(first_record)
         root = ET.Element('oai_records')
         for record in records:
             record_elem = ET.fromstring(record)
             root.append(record_elem)
 
         xml_content = ET.tostring(root, encoding='unicode', method='xml')
-
         compressed_content = gzip.compress(xml_content.encode('utf-8'))
 
-        object_key = f"doaj/{record_type}/{start_id}-{end_id}.xml.gz"
+        object_key = f"doaj/{record_type}/{date_path}/{record_type}_page_{batch_number}_{int(time.time())}.xml.gz"
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
@@ -51,8 +54,8 @@ def upload_worker(q):
             break
 
         try:
-            record_type, batch_number, records = item
-            upload_batch(record_type, batch_number, records, s3)
+            record_type, batch_number, records, first_record = item
+            upload_batch(record_type, batch_number, records, first_record, s3)
         except Exception as e:
             LOGGER.error(f"Error in upload worker: {e}")
 
@@ -82,17 +85,22 @@ def harvest_records(record_type, num_threads, update_mode=False):
     count = 0
     start_time = time.time()
     current_batch = []
+    current_batch_first_record = None
     batch_number = 0
 
     try:
         for record in records:
+            if not current_batch_first_record:
+                current_batch_first_record = record
             current_batch.append(record.raw)
             count += 1
 
             if len(current_batch) >= BATCH_SIZE:
-                upload_queue.put((record_type, batch_number, current_batch))
+                upload_queue.put((record_type, batch_number, current_batch,
+                                  current_batch_first_record))
                 batch_number += 1
                 current_batch = []
+                current_batch_first_record = None
 
             if count % 100 == 0:
                 elapsed_hours = (time.time() - start_time) / 3600
@@ -101,7 +109,8 @@ def harvest_records(record_type, num_threads, update_mode=False):
                     f"Fetched {count} DOAJ {record_type}. Rate: {rate_per_hour:.0f}/hour")
 
         if current_batch:
-            upload_queue.put((record_type, batch_number, current_batch))
+            upload_queue.put((record_type, batch_number, current_batch,
+                              current_batch_first_record))
 
     except Exception as e:
         LOGGER.error(f"Error fetching records: {e}")
@@ -117,12 +126,10 @@ def harvest_records(record_type, num_threads, update_mode=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--threads', type=int, default=20,
-                        help='Number of upload threads')
-    parser.add_argument('--update', action='store_true',
-                        help='Only fetch records updated since yesterday')
+    parser.add_argument('--threads', type=int, default=20)
+    parser.add_argument('--update', action='store_true')
     parser.add_argument('--type', choices=['articles', 'journals'],
-                        required=True, help='Type of records to harvest')
+                        required=True)
     args = parser.parse_args()
 
     harvest_records(args.type, args.threads, args.update)

@@ -1,5 +1,4 @@
 import gzip
-from urllib.parse import quote
 import boto3
 import requests
 from queue import Queue
@@ -14,12 +13,17 @@ from common import S3_BUCKET, LOGGER
 BATCH_SIZE = 1000
 
 
-def upload_batch(batch_number, works, s3_client):
-    try:
-        start_id = (batch_number * BATCH_SIZE) + 1
-        end_id = start_id + len(works) - 1
+def get_datetime_path(updated):
+    dt = datetime.fromisoformat(updated.replace('Z', '+00:00'))
+    return f"{dt.year}/{dt.month:02d}/{dt.day:02d}/{dt.hour:02d}"
 
-        object_key = f"datacite/works/{start_id}-{end_id}.json"
+
+def upload_batch_api(batch_number, works, s3_client):
+    try:
+        first_work = works[0]
+        updated = first_work['attributes']['updated']
+        date_path = get_datetime_path(updated)
+        object_key = f"datacite/works/{date_path}/works_page_{batch_number}_{int(time.time())}.json"
 
         s3_client.put_object(
             Bucket=S3_BUCKET,
@@ -32,7 +36,22 @@ def upload_batch(batch_number, works, s3_client):
         LOGGER.error(f"Error uploading batch {batch_number}: {e}")
 
 
-def upload_worker(q):
+def upload_batch_datafile(batch_number, works, s3_client):
+    try:
+        object_key = f"datacite/datafile_2023_works/{batch_number * BATCH_SIZE}.json"
+
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=object_key,
+            Body=json.dumps(works),
+            ContentType='application/json'
+        )
+
+    except Exception as e:
+        LOGGER.error(f"Error uploading batch {batch_number}: {e}")
+
+
+def upload_worker(q, is_api):
     s3 = boto3.client('s3')
     while True:
         item = q.get()
@@ -41,7 +60,10 @@ def upload_worker(q):
 
         try:
             batch_number, works = item
-            upload_batch(batch_number, works, s3)
+            if is_api:
+                upload_batch_api(batch_number, works, s3)
+            else:
+                upload_batch_datafile(batch_number, works, s3)
         except Exception as e:
             LOGGER.error(f"Error in upload worker: {e}")
 
@@ -109,12 +131,12 @@ def datafile_works_iterator():
             LOGGER.error(f"Error processing chunk: {e}")
 
 
-def harvest_works(works_iterator, num_threads, doi_getter):
+def harvest_works(works_iterator, num_threads, doi_getter, is_api):
     upload_queue = Queue()
 
     workers = []
     for _ in range(num_threads):
-        t = threading.Thread(target=upload_worker, args=(upload_queue,))
+        t = threading.Thread(target=upload_worker, args=(upload_queue, is_api))
         t.start()
         workers.append(t)
 
@@ -161,14 +183,10 @@ def harvest_works(works_iterator, num_threads, doi_getter):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--threads', type=int, default=20,
-                        help='Number of upload threads')
-    parser.add_argument('--from-date', default='2023-12-01',
-                        help='Fetch works updated since this date (YYYY-MM-DD)')
-    parser.add_argument('--update', action='store_true',
-                        help='Only fetch works updated in the last 24 hours')
-    parser.add_argument('--source', choices=['api', 'datafile'], default='api',
-                        help='Source of works (API or datafile)')
+    parser.add_argument('--threads', type=int, default=20)
+    parser.add_argument('--from-date', default='2023-12-01')
+    parser.add_argument('--update', action='store_true')
+    parser.add_argument('--source', choices=['api', 'datafile'], default='api')
     args = parser.parse_args()
 
     if args.source == 'api':
@@ -182,8 +200,10 @@ if __name__ == "__main__":
 
         works_iterator = lambda: fetch_works(from_date)
         doi_getter = lambda work: work['attributes']['doi']
+        is_api = True
     else:
         works_iterator = datafile_works_iterator
         doi_getter = lambda work: work['doi']
+        is_api = False
 
-    harvest_works(works_iterator, args.threads, doi_getter)
+    harvest_works(works_iterator, args.threads, doi_getter, is_api)
