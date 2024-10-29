@@ -183,7 +183,29 @@ def upload_worker(results_queue):
         results_queue.task_done()
 
 
-def main(num_threads, resume_index=0):
+def get_resume_index():
+    s3 = boto3.client('s3')
+    folder_path = 'issn-portal/journals'
+
+    try:
+        files_count = 0
+        paginator = s3.get_paginator('list_objects_v2')
+
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=folder_path):
+            if 'Contents' in page:
+                files_count += len(page['Contents'])
+
+        resume_index = files_count * BATCH_SIZE
+        LOGGER.info(
+            f"Found {files_count} files in S3, resuming from index {resume_index}")
+        return resume_index
+
+    except Exception as e:
+        LOGGER.error(f"Error getting number of files from S3: {e}")
+        return 0
+
+
+def main(num_threads):
     try:
         auth_token = get_auth_token()
         LOGGER.info("Successfully authenticated with ISSN Portal")
@@ -192,13 +214,17 @@ def main(num_threads, resume_index=0):
         return
 
     sources = load_sources()
+    resume_index = get_resume_index()
+
+    if resume_index > 0:
+        sources = sources[resume_index:]
+        LOGGER.info(
+            f"Resuming from index {resume_index}, {len(sources)} sources remaining")
+
     total_sources = len(sources)
     LOGGER.info(f"Loaded {total_sources} sources to process")
-    if resume_index > 0:
-        LOGGER.info(f'Resuming from index {resume_index}')
-        sources = sources[resume_index:]
 
-    if not sources:
+    if not total_sources:
         LOGGER.info("No sources to process")
         return
 
@@ -246,7 +272,6 @@ def main(num_threads, resume_index=0):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--threads', type=int, default=10)
-    parser.add_argument('--resume_index', '-r', type=int, default=0)
     args = parser.parse_args()
 
-    main(args.threads, args.resume_index)
+    main(args.threads)
