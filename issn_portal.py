@@ -139,18 +139,18 @@ def load_sources():
 def get_resume_index():
     s3 = boto3.client('s3')
     bucket_name = 'openalex-ingest'
-    folder_path = 'issn-portal/journals'
+    folder_path = 'issn-portal/journals/'
 
     try:
-        # Get all files with pagination
         files_count = 0
         paginator = s3.get_paginator('list_objects_v2')
 
         for page in paginator.paginate(Bucket=bucket_name, Prefix=folder_path):
             if 'Contents' in page:
-                files_count += len(page['Contents'])
+                for file in page['Contents']:
+                    if file['Key'] != folder_path:
+                        files_count += 1
 
-        # Calculate resume index and starting batch number
         resume_index = files_count * BATCH_SIZE
         starting_batch = files_count
         LOGGER.info(
