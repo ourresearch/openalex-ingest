@@ -1,4 +1,3 @@
-from urllib.parse import quote
 import boto3
 import requests
 from sickle import Sickle
