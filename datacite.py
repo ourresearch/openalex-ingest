@@ -1,4 +1,7 @@
 import gzip
+import os
+import tempfile
+
 import boto3
 import requests
 from queue import Queue
@@ -98,38 +101,33 @@ def fetch_works(from_date):
 
 
 def datafile_works_iterator():
-    s3 = boto3.client('s3')
-    datafile_path = 'datacite/datafile_2023'
+    try:
+        s3 = boto3.client('s3')
+        datafile_path = 'datacite/datafile_2023'
+        LOGGER.info("Starting download of datafile to temp storage")
 
-    response = s3.get_object(Bucket=S3_BUCKET, Key=datafile_path)
-    stream = response['Body']
-
-    decompressor = gzip.GzipFile(fileobj=stream)
-
-    buffer = ''
-
-    while True:
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
         try:
-            chunk = decompressor.read(1024 * 1024).decode('utf-8')
-            if not chunk:
-                if buffer:
-                    try:
-                        yield json.loads(buffer)
-                    except json.JSONDecodeError as e:
-                        LOGGER.error(f"Error parsing JSON from buffer: {e}")
-                break
+            s3.download_file(S3_BUCKET, datafile_path, temp_file.name)
+            LOGGER.info(
+                "Datafile downloaded successfully, beginning processing")
 
-            lines = (buffer + chunk).split('\n')
-            buffer = lines[-1]
+            with gzip.open(temp_file.name, 'rt') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError as e:
+                            LOGGER.error(f"Error parsing JSON line: {e}")
 
-            for line in lines[:-1]:
-                if line.strip():
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError as e:
-                        LOGGER.error(f"Error parsing JSON line: {e}")
-        except Exception as e:
-            LOGGER.error(f"Error processing chunk: {e}")
+        finally:
+            temp_file.close()
+            os.unlink(temp_file.name)
+            LOGGER.info("Temporary file cleaned up")
+
+    except Exception as e:
+        LOGGER.error(f"Error handling datafile: {e}")
+        raise
 
 
 def harvest_works(works_iterator, num_threads, doi_getter):
