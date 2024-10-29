@@ -6,6 +6,8 @@ import argparse
 from queue import Queue, Empty
 import requests
 import boto3
+from tenacity import retry, stop_after_attempt, wait_exponential, \
+    retry_if_exception_type
 
 from common import S3_BUCKET, LOGGER
 
@@ -31,7 +33,8 @@ class ProgressTracker:
     def get_stats(self):
         with self.lock:
             return (self.completed_sources, self.successful_sources,
-                   self.failed_sources, self.total_sources)
+                    self.failed_sources, self.total_sources)
+
 
 def progress_logger(tracker, stop_event):
     start_time = time.time()
@@ -66,6 +69,20 @@ def get_auth_token():
     return response.json()['token']
 
 
+def should_retry_exception(exception):
+    if isinstance(exception, requests.exceptions.HTTPError):
+        return exception.response.status_code == 403
+    return False
+
+
+@retry(
+    retry=retry_if_exception_type(should_retry_exception),
+    wait=wait_exponential(multiplier=1, min=4, max=300),  # max 5 minutes
+    stop=stop_after_attempt(5),
+    before_sleep=lambda retry_state: LOGGER.info(
+        f"Got 403, retrying after error: {retry_state.outcome.exception()}. "
+        f"Attempt {retry_state.attempt_number}")
+)
 def fetch_issn_record(issn, auth_token):
     url = f"https://api.issn.org/notice/{issn}"
     headers = {
@@ -81,6 +98,14 @@ def fetch_issn_record(issn, auth_token):
     return response.json()
 
 
+@retry(
+    retry=retry_if_exception_type(should_retry_exception),
+    wait=wait_exponential(multiplier=1, min=4, max=300),  # max 5 minutes
+    stop=stop_after_attempt(5),
+    before_sleep=lambda retry_state: LOGGER.info(
+        f"Got 403, retrying after error: {retry_state.outcome.exception()}. "
+        f"Attempt {retry_state.attempt_number}")
+)
 def search_by_display_name(display_name, auth_token):
     search_params = {
         "search": [f"keytitle={display_name}"],
@@ -109,6 +134,32 @@ def load_sources():
     response = s3.get_object(Bucket='openalex-ingest',
                              Key='issn-portal/sources.json')
     return json.loads(response['Body'].read().decode('utf-8'))
+
+
+def get_resume_index():
+    s3 = boto3.client('s3')
+    bucket_name = 'openalex-ingest'
+    folder_path = 'issn-portal/journals'
+
+    try:
+        # Get all files with pagination
+        files_count = 0
+        paginator = s3.get_paginator('list_objects_v2')
+
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=folder_path):
+            if 'Contents' in page:
+                files_count += len(page['Contents'])
+
+        # Calculate resume index and starting batch number
+        resume_index = files_count * BATCH_SIZE
+        starting_batch = files_count
+        LOGGER.info(
+            f"Found {files_count} files in S3, resuming from index {resume_index} with batch {starting_batch}")
+        return resume_index, starting_batch
+
+    except Exception as e:
+        LOGGER.error(f"Error getting number of files from S3: {e}")
+        return 0, 0
 
 
 def upload_batch(batch_records, batch_number, s3_client):
@@ -160,10 +211,10 @@ def worker(queue, results_queue, auth_token, tracker):
         queue.task_done()
 
 
-def upload_worker(results_queue):
+def upload_worker(results_queue, starting_batch=0):
     s3 = boto3.client('s3')
     current_batch = []
-    batch_number = 0
+    batch_number = starting_batch
 
     while True:
         try:
@@ -183,28 +234,6 @@ def upload_worker(results_queue):
         results_queue.task_done()
 
 
-def get_resume_index():
-    s3 = boto3.client('s3')
-    folder_path = 'issn-portal/journals'
-
-    try:
-        files_count = 0
-        paginator = s3.get_paginator('list_objects_v2')
-
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=folder_path):
-            if 'Contents' in page:
-                files_count += len(page['Contents'])
-
-        resume_index = files_count * BATCH_SIZE
-        LOGGER.info(
-            f"Found {files_count} files in S3, resuming from index {resume_index}")
-        return resume_index
-
-    except Exception as e:
-        LOGGER.error(f"Error getting number of files from S3: {e}")
-        return 0
-
-
 def main(num_threads):
     try:
         auth_token = get_auth_token()
@@ -214,12 +243,12 @@ def main(num_threads):
         return
 
     sources = load_sources()
-    resume_index = get_resume_index()
+    resume_index, starting_batch = get_resume_index()
 
     if resume_index > 0:
         sources = sources[resume_index:]
         LOGGER.info(
-            f"Resuming from index {resume_index}, {len(sources)} sources remaining")
+            f"Resuming from index {resume_index}, {len(sources)} sources remaining, starting at batch {starting_batch}")
 
     total_sources = len(sources)
     LOGGER.info(f"Loaded {total_sources} sources to process")
@@ -243,12 +272,13 @@ def main(num_threads):
     workers = []
     for _ in range(num_threads):
         t = threading.Thread(target=worker,
-                             args=(source_queue, results_queue, auth_token, tracker))
+                             args=(
+                             source_queue, results_queue, auth_token, tracker))
         t.start()
         workers.append(t)
 
     upload_thread = threading.Thread(target=upload_worker,
-                                     args=(results_queue, ))
+                                     args=(results_queue, starting_batch))
     upload_thread.start()
 
     for source in sources:
@@ -265,8 +295,10 @@ def main(num_threads):
     stop_event.set()
     progress_thread.join()
 
-    completed, total = tracker.get_stats()
-    LOGGER.info(f"Completed processing {completed}/{total} sources")
+    completed, successes, failures, total = tracker.get_stats()
+    LOGGER.info(
+        f"Completed processing {completed}/{total} sources. "
+        f"Successes: {successes}, Failures: {failures}")
 
 
 if __name__ == '__main__':
