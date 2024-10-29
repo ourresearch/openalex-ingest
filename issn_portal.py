@@ -1,57 +1,21 @@
+import argparse
 import json
 import os
 import threading
 import time
-import argparse
 from queue import Queue, Empty
-import requests
+
 import boto3
+import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, \
-    retry_if_exception_type
+    retry_if_exception
 
 from common import S3_BUCKET, LOGGER
 
 BATCH_SIZE = 1000
 
-
-class ProgressTracker:
-    def __init__(self, total_sources):
-        self.total_sources = total_sources
-        self.completed_sources = 0
-        self.successful_sources = 0
-        self.failed_sources = 0
-        self.lock = threading.Lock()
-
-    def increment(self, success=True):
-        with self.lock:
-            self.completed_sources += 1
-            if success:
-                self.successful_sources += 1
-            else:
-                self.failed_sources += 1
-
-    def get_stats(self):
-        with self.lock:
-            return (self.completed_sources, self.successful_sources,
-                    self.failed_sources, self.total_sources)
-
-
-def progress_logger(tracker, stop_event):
-    start_time = time.time()
-    while not stop_event.is_set():
-        completed, successes, failures, total = tracker.get_stats()
-        elapsed_hours = (time.time() - start_time) / 3600
-        rate_per_hour = completed / elapsed_hours if elapsed_hours > 0 else 0
-        percent_complete = (completed / total * 100) if total > 0 else 0
-        success_rate = (successes / completed * 100) if completed > 0 else 0
-        failure_rate = (failures / completed * 100) if completed > 0 else 0
-
-        LOGGER.info(
-            f"Progress: {completed}/{total} sources ({percent_complete:.1f}%) | "
-            f"Success: {successes} ({success_rate:.1f}%) | "
-            f"Failed: {failures} ({failure_rate:.1f}%) | "
-            f"Rate: {rate_per_hour:.0f}/hour")
-        time.sleep(5)
+token_lock = threading.Lock()
+current_token = None
 
 
 def get_auth_token():
@@ -59,8 +23,7 @@ def get_auth_token():
     password = os.environ.get('ISSN_PORTAL_PASS')
 
     if not username or not password:
-        raise ValueError(
-            "ISSN Portal credentials not found in environment variables")
+        raise ValueError("ISSN Portal credentials not found in environment variables")
 
     auth_url = f"https://api.issn.org/authenticate/{username}/{password}"
     response = requests.get(auth_url, headers={"Accept": "application/json"})
@@ -69,25 +32,46 @@ def get_auth_token():
     return response.json()['token']
 
 
+def get_current_token():
+    global current_token
+    with token_lock:
+        if current_token is None:
+            current_token = get_auth_token()
+        return current_token
+
+
+def refresh_token():
+    global current_token
+    with token_lock:
+        current_token = get_auth_token()
+        LOGGER.info("Successfully refreshed authentication token")
+        return current_token
+
+
 def should_retry_exception(exception):
     if isinstance(exception, requests.exceptions.HTTPError):
-        return exception.response.status_code == 403
+        if exception.response.status_code == 403:
+            try:
+                refresh_token()
+                return True
+            except Exception as e:
+                LOGGER.error(f"Failed to refresh token: {e}")
+                return False
     return False
 
 
 @retry(
-    retry=retry_if_exception_type(should_retry_exception),
-    wait=wait_exponential(multiplier=1, min=4, max=300),  # max 5 minutes
+    retry=retry_if_exception(should_retry_exception),
+    wait=wait_exponential(multiplier=1, min=4, max=300),
     stop=stop_after_attempt(5),
     before_sleep=lambda retry_state: LOGGER.info(
-        f"Got 403, retrying after error: {retry_state.outcome.exception()}. "
-        f"Attempt {retry_state.attempt_number}")
+        f"Got 403, retrying with fresh token. Attempt {retry_state.attempt_number}")
 )
-def fetch_issn_record(issn, auth_token):
+def fetch_issn_record(issn):
     url = f"https://api.issn.org/notice/{issn}"
     headers = {
         "Accept": "application/json",
-        "Authorization": f"JWT {auth_token}"
+        "Authorization": f"JWT {get_current_token()}"
     }
     params = {
         "json": "true"
@@ -99,14 +83,13 @@ def fetch_issn_record(issn, auth_token):
 
 
 @retry(
-    retry=retry_if_exception_type(should_retry_exception),
-    wait=wait_exponential(multiplier=1, min=4, max=300),  # max 5 minutes
+    retry=retry_if_exception(should_retry_exception),
+    wait=wait_exponential(multiplier=1, min=4, max=300),
     stop=stop_after_attempt(5),
     before_sleep=lambda retry_state: LOGGER.info(
-        f"Got 403, retrying after error: {retry_state.outcome.exception()}. "
-        f"Attempt {retry_state.attempt_number}")
+        f"Got 403, retrying with fresh token. Attempt {retry_state.attempt_number}")
 )
-def search_by_display_name(display_name, auth_token):
+def search_by_display_name(display_name):
     search_params = {
         "search": [f"keytitle={display_name}"],
         "page": 0,
@@ -116,7 +99,7 @@ def search_by_display_name(display_name, auth_token):
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Authorization": f"JWT {auth_token}"
+        "Authorization": f"JWT {get_current_token()}"
     }
 
     response = requests.post("https://api.issn.org/search?json=true",
@@ -175,7 +158,47 @@ def upload_batch(batch_records, batch_number, s3_client):
         LOGGER.error(f"Error uploading batch {batch_number}: {e}")
 
 
-def worker(queue, results_queue, auth_token, tracker):
+class ProgressTracker:
+    def __init__(self, total_sources):
+        self.total_sources = total_sources
+        self.completed_sources = 0
+        self.successful_sources = 0
+        self.failed_sources = 0
+        self.lock = threading.Lock()
+
+    def increment(self, success=True):
+        with self.lock:
+            self.completed_sources += 1
+            if success:
+                self.successful_sources += 1
+            else:
+                self.failed_sources += 1
+
+    def get_stats(self):
+        with self.lock:
+            return (self.completed_sources, self.successful_sources,
+                    self.failed_sources, self.total_sources)
+
+
+def progress_logger(tracker, stop_event):
+    start_time = time.time()
+    while not stop_event.is_set():
+        completed, successes, failures, total = tracker.get_stats()
+        elapsed_hours = (time.time() - start_time) / 3600
+        rate_per_hour = completed / elapsed_hours if elapsed_hours > 0 else 0
+        percent_complete = (completed / total * 100) if total > 0 else 0
+        success_rate = (successes / completed * 100) if completed > 0 else 0
+        failure_rate = (failures / completed * 100) if completed > 0 else 0
+
+        LOGGER.info(
+            f"Progress: {completed}/{total} sources ({percent_complete:.1f}%) | "
+            f"Success: {successes} ({success_rate:.1f}%) | "
+            f"Failed: {failures} ({failure_rate:.1f}%) | "
+            f"Rate: {rate_per_hour:.0f}/hour")
+        time.sleep(5)
+
+
+def worker(queue, results_queue, tracker):
     while True:
         item = queue.get()
         if item is None:
@@ -187,15 +210,14 @@ def worker(queue, results_queue, auth_token, tracker):
 
             for issn in source['issns']:
                 try:
-                    record = fetch_issn_record(issn, auth_token)
+                    record = fetch_issn_record(issn)
                     break
                 except Exception as e:
                     LOGGER.error(f'Error fetching ISSN {issn}: {e}')
                     continue
 
             if not record:
-                record = search_by_display_name(source['display_name'],
-                                                auth_token)
+                record = search_by_display_name(source['display_name'])
 
             if record:
                 results_queue.put(record)
@@ -204,8 +226,7 @@ def worker(queue, results_queue, auth_token, tracker):
                 tracker.increment(success=False)
 
         except Exception as e:
-            LOGGER.error(
-                f"Error processing source {source['display_name']}: {e}")
+            LOGGER.error(f"Error processing source {source['display_name']}: {e}")
             tracker.increment(success=False)
 
         queue.task_done()
@@ -218,7 +239,7 @@ def upload_worker(results_queue, starting_batch=0):
 
     while True:
         try:
-            record = results_queue.get(timeout=300)  # 5 minute timeout
+            record = results_queue.get(timeout=300)
             current_batch.append(record)
 
             if len(current_batch) >= BATCH_SIZE:
@@ -236,7 +257,7 @@ def upload_worker(results_queue, starting_batch=0):
 
 def main(num_threads):
     try:
-        auth_token = get_auth_token()
+        refresh_token()
         LOGGER.info("Successfully authenticated with ISSN Portal")
     except Exception as e:
         LOGGER.error(f"Authentication failed: {e}")
@@ -272,13 +293,12 @@ def main(num_threads):
     workers = []
     for _ in range(num_threads):
         t = threading.Thread(target=worker,
-                             args=(
-                             source_queue, results_queue, auth_token, tracker))
+                           args=(source_queue, results_queue, tracker))
         t.start()
         workers.append(t)
 
     upload_thread = threading.Thread(target=upload_worker,
-                                     args=(results_queue, starting_batch))
+                                   args=(results_queue, starting_batch))
     upload_thread.start()
 
     for source in sources:
@@ -290,6 +310,7 @@ def main(num_threads):
     for w in workers:
         w.join()
 
+    results_queue.join()
     upload_thread.join()
 
     stop_event.set()
