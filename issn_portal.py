@@ -183,7 +183,7 @@ def upload_worker(results_queue):
         results_queue.task_done()
 
 
-def main(num_threads):
+def main(num_threads, resume_index=0):
     try:
         auth_token = get_auth_token()
         LOGGER.info("Successfully authenticated with ISSN Portal")
@@ -194,6 +194,9 @@ def main(num_threads):
     sources = load_sources()
     total_sources = len(sources)
     LOGGER.info(f"Loaded {total_sources} sources to process")
+    if resume_index > 0:
+        LOGGER.info(f'Resuming from index {resume_index}')
+        sources = sources[resume_index:]
 
     if not sources:
         LOGGER.info("No sources to process")
@@ -243,6 +246,7 @@ def main(num_threads):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--threads', type=int, default=10)
+    parser.add_argument('--resume_index', '-r', type=int, default=0)
     args = parser.parse_args()
 
-    main(args.threads)
+    main(args.threads, args.resume_index)
