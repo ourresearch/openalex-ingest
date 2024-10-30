@@ -27,7 +27,10 @@ class APIWorksIterator:
 
     @retry(stop=stop_after_attempt(5),
            wait=wait_exponential(multiplier=1, min=4, max=10),
-           retry=retry_if_exception_type(requests.exceptions.RequestException))
+           retry=retry_if_exception_type(requests.exceptions.RequestException),
+           before_sleep=lambda retry_state: LOGGER.info(
+               f"Retrying API request after error: {retry_state.outcome.exception()}. Attempt {retry_state.attempt_number}")
+           )
     def _fetch_page(self, args):
         page, total_pages = args
         try:
