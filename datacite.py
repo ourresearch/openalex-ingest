@@ -83,7 +83,8 @@ def fetch_works(from_date):
         params = {
             'page[size]': page_size,
             'page[number]': page,
-            'query': f'updated:[{from_date} TO *]',
+            'query': f'updated:[{from_date}T00:00:00Z TO *]',
+            'sort': 'updated',
             'include': 'data-center,publisher,client,media,references,citations,predecessor-versions,successor-versions,contributors,affiliations'
         }
 
