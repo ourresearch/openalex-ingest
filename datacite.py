@@ -12,8 +12,27 @@ import boto3
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, \
     wait_exponential
-
 from common import S3_BUCKET, LOGGER
+
+
+class BatchTracker:
+    def __init__(self):
+        self.path_counters = {}
+        self.lock = threading.Lock()
+
+    def get_next_batch_number(self, date_path):
+        with self.lock:
+            if date_path is None:
+                # For datafile iterator, just use a simple counter
+                current = self.path_counters.get('datafile', -1)
+                next_number = current + 1
+                self.path_counters['datafile'] = next_number
+                return next_number
+
+            current = self.path_counters.get(date_path, -1)
+            next_number = current + 1
+            self.path_counters[date_path] = next_number
+            return next_number
 
 
 class APIWorksIterator:
@@ -172,6 +191,7 @@ def upload_worker(q, stop_event):
 def harvest_works(works_iterator, upload_threads):
     upload_queue = Queue(maxsize=upload_threads * 2)
     stop_event = threading.Event()
+    batch_tracker = BatchTracker()
 
     upload_workers = []
     for _ in range(upload_threads):
@@ -182,7 +202,6 @@ def harvest_works(works_iterator, upload_threads):
 
     count = 0
     start_time = time.time()
-    batch_number = 0
     current_batch = []
     current_date_path = None
 
@@ -194,15 +213,15 @@ def harvest_works(works_iterator, upload_threads):
 
                 if date_path and date_path != current_date_path:
                     current_date_path = date_path
-                    batch_number = 0
 
                 current_batch.append(work)
                 count += 1
 
                 if len(current_batch) >= works_iterator.BATCH_SIZE:
-                    upload_queue.put((batch_number, current_batch,
-                                      current_date_path, timestamp))
-                    batch_number += 1
+                    batch_number = batch_tracker.get_next_batch_number(
+                        date_path)
+                    upload_queue.put(
+                        (batch_number, current_batch, date_path, timestamp))
                     current_batch = []
 
                 if count % 1000 == 0:
@@ -215,8 +234,9 @@ def harvest_works(works_iterator, upload_threads):
                 LOGGER.error(f"Error processing work: {e}")
 
         if current_batch:
+            batch_number = batch_tracker.get_next_batch_number(date_path)
             upload_queue.put(
-                (batch_number, current_batch, current_date_path, timestamp))
+                (batch_number, current_batch, date_path, timestamp))
 
     except Exception as e:
         LOGGER.error(f"Error processing works: {e}")
