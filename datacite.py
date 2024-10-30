@@ -10,6 +10,9 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import boto3
 import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, \
+    wait_exponential
+
 from common import S3_BUCKET, LOGGER
 
 
@@ -22,6 +25,9 @@ class APIWorksIterator:
         self.base_url = "https://api.datacite.org/works"
         self.page_size = 1000
 
+    @retry(stop=stop_after_attempt(5),
+           wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type(requests.exceptions.RequestException))
     def _fetch_page(self, args):
         page, total_pages = args
         try:
