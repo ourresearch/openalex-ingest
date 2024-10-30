@@ -196,7 +196,7 @@ def harvest_works(works_iterator, upload_threads):
                     batch_number += 1
                     current_batch = []
 
-                if count % 100 == 0:
+                if count % 1000 == 0:
                     elapsed_hours = (time.time() - start_time) / 3600
                     rate_per_hour = count / elapsed_hours
                     LOGGER.info(
