@@ -1,12 +1,12 @@
 import io
 import json
 import requests
-import logging
 import boto3
 import pandas as pd
 from zipfile import ZipFile
 
-logging = logging.getLogger(__name__)
+from common import S3_BUCKET, LOGGER
+
 
 def get_most_recent_ror_dump_metadata():
     # https://ror.readme.io/docs/data-dump#download-ror-data-dumps-programmatically-with-the-zenodo-api
@@ -37,37 +37,35 @@ def get_file_list_s3_bucket(bucket_name, prefix):
     return [obj.key for obj in bucket.objects.filter(Prefix=prefix) if obj.key.endswith(".parquet")]
 
 def main():
-    ror_bucket = "openalex-ingest"
-    
     most_recent_file_obj = get_most_recent_ror_dump_metadata()
 
     if most_recent_file_obj is None:
-        logging.info("Failed to get ROR data. Exiting without doing any updates...")
+        LOGGER.info("Failed to get ROR data. Exiting without doing any updates...")
         return
     
     try:
         file_url = most_recent_file_obj["links"]["self"]
     except KeyError:
-        logging.error("Failed to get URL out of the most recent file! Exiting without doing any updates...")
+        LOGGER.error("Failed to get URL out of the most recent file! Exiting without doing any updates...")
         raise
 
-    logging.info(f"downloading and unzipping ROR data from {file_url}")
+    LOGGER.info(f"downloading and unzipping ROR data from {file_url}")
     ror_data, fname = download_and_unzip_ror_data(file_url)
     if not ror_data:
         raise RuntimeError(
             "Failed to download and unzip ROR data! Exiting without doing any updates..."
         )
 
-    files_in_s3 = get_file_list_s3_bucket(ror_bucket, "ror/snapshots")
+    files_in_s3 = get_file_list_s3_bucket(S3_BUCKET, "ror/snapshots")
 
     if f"ror/snapshots/{fname}.parquet" in files_in_s3:
-        logging.info(f"Most recent ROR snapshot already saved. Exiting without saving snapshot...")
+        LOGGER.info(f"Most recent ROR snapshot already saved. Exiting without saving snapshot...")
         return
     
-    logging.info(f"Saving snapshot for {len(ror_data)} ROR records")
-    pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror/snapshots/{fname}.parquet")
-    pd.DataFrame(ror_data).to_parquet(f"s3://{ror_bucket}/ror/current/ror_snapshot.parquet")
-    logging.info(f"Saved snapshots!")
+    LOGGER.info(f"Saving snapshot for {len(ror_data)} ROR records")
+    pd.DataFrame(ror_data).to_parquet(f"s3://{S3_BUCKET}/ror/snapshots/{fname}.parquet")
+    pd.DataFrame(ror_data).to_parquet(f"s3://{S3_BUCKET}/ror/current/ror_snapshot.parquet")
+    LOGGER.info(f"Saved snapshots!")
 
 if __name__ == '__main__':
     main()
