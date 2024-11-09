@@ -1,102 +1,81 @@
 import argparse
-import datetime
-import inspect
-import json
-import os
+from contextlib import contextmanager
+from datetime import datetime, timedelta, UTC
 import gzip
+import logging
+import os
 import threading
 from time import sleep, time
-from dataclasses import dataclass, asdict
 from typing import Optional, List
-import logging
+
+
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+from defusedxml.ElementTree import ParseError
 import requests
-import xml.etree.ElementTree as ET
-from sickle import Sickle, oaiexceptions
+import shortuuid
+from sickle import Sickle
 from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
-from sickle.oaiexceptions import NoRecordsMatch, BadArgument
+from sickle.oaiexceptions import NoRecordsMatch
 from sickle.response import OAIResponse
+from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_
+import tenacity
+import xml.etree.ElementTree as ET
 
-from common import S3_BUCKET, LOGGER
+from common import Base, db, LOGGER, S3_BUCKET
 
 
-@dataclass
-class EndpointState:
-    id: str
-    pmh_url: str
-    pmh_set: Optional[str]
-    metadata_prefix: str = 'oai_dc'
-    last_harvest_started: Optional[str] = None
-    last_harvest_finished: Optional[str] = None
-    most_recent_year_harvested: Optional[str] = None
-    error: Optional[str] = None
-    ready_to_run: bool = True
-    retry_at: Optional[str] = None
+class Endpoint(Base):
+    __tablename__ = "endpoint"
 
-    @classmethod
-    def from_dict(cls, data):
-        return cls(**data)
+    id = Column(Text, primary_key=True)
+    id_old = Column(Text)
+    pmh_url = Column(Text)
+    pmh_set = Column(Text)
+    last_harvest_started = Column(DateTime)
+    last_harvest_finished = Column(DateTime)
+    most_recent_date_harvested = Column(DateTime)
+    earliest_timestamp = Column(DateTime)
+    email = Column(Text)
+    error = Column(Text)
+    repo_request_id = Column(Text)
+    harvest_identify_response = Column(Text)
+    harvest_test_recent_dates = Column(Text)
+    sample_pmh_record = Column(Text)
+    contacted = Column(DateTime)
+    contacted_text = Column(Text)
+    policy_promises_no_submitted = Column(Boolean)
+    policy_promises_no_submitted_evidence = Column(Text)
+    ready_to_run = Column(Boolean)
+    metadata_prefix = Column(Text)
+    retry_interval = Column(Interval)
+    retry_at = Column(DateTime)
+    is_core = Column(Boolean)
 
-    def to_dict(self):
-        return {k: str(v) if isinstance(v, datetime.datetime) else v
-                for k, v in asdict(self).items()}
+    def __init__(self, **kwargs):
+        super(self.__class__, self).__init__(**kwargs)
+        if not self.id:
+            self.id = shortuuid.uuid()[0:20].lower()
+        if not self.metadata_prefix:
+            self.metadata_prefix = 'oai_dc'
 
 
 class StateManager:
-    def __init__(self, bucket: str,
-                 state_prefix: str = "repositories/endpoints_state"):
-        self.s3_client = boto3.client('s3')
-        self.bucket = bucket
-        self.state_prefix = state_prefix
+    def get_endpoint(self, endpoint_id: str) -> Optional[Endpoint]:
+        return db.query(Endpoint).filter_by(id=endpoint_id).first()
 
-    def _get_state_key(self, endpoint_id: str) -> str:
-        return f"{self.state_prefix}/{endpoint_id}.json"
+    def update_endpoint_state(self, state: Endpoint):
+        db.merge(state)
+        db.commit()
 
-    def get_endpoint(self, endpoint_id: str) -> Optional[EndpointState]:
-        try:
-            response = self.s3_client.get_object(
-                Bucket=self.bucket,
-                Key=self._get_state_key(endpoint_id)
-            )
-            state_dict = json.loads(response['Body'].read().decode('utf-8'))
-            return EndpointState.from_dict(state_dict)
-        except self.s3_client.exceptions.NoSuchKey:
-            return None
-
-    def update_endpoint_state(self, state: EndpointState):
-        self.s3_client.put_object(
-            Bucket=self.bucket,
-            Key=self._get_state_key(state.id),
-            Body=json.dumps(state.to_dict()),
-            ContentType='application/json'
-        )
-
-    def get_ready_endpoints(self) -> List[EndpointState]:
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-        ready_endpoints = []
-
-        for page in paginator.paginate(Bucket=self.bucket,
-                                       Prefix=self.state_prefix):
-            for obj in page.get('Contents', []):
-                try:
-                    response = self.s3_client.get_object(
-                        Bucket=self.bucket,
-                        Key=obj['Key']
-                    )
-                    state_dict = json.loads(
-                        response['Body'].read().decode('utf-8'))
-                    state = EndpointState.from_dict(state_dict)
-
-                    if state.ready_to_run:
-                        if not state.retry_at or datetime.datetime.fromisoformat(
-                                state.retry_at) <= datetime.datetime.utcnow():
-                            ready_endpoints.append(state)
-                except Exception as e:
-                    LOGGER.error(
-                        f"Error processing state file {obj['Key']}: {e}")
-                    continue
-
+    def get_ready_endpoints(self, core_endpoints=False) -> List[Endpoint]:
+        now = datetime.now(UTC)
+        ready_endpoints = db.query(Endpoint).filter(
+            Endpoint.ready_to_run == True,
+            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+            Endpoint.is_core == core_endpoints
+        ).all()
         return ready_endpoints
 
 
@@ -151,17 +130,56 @@ class MetricsLogger:
 
 
 class EndpointHarvester:
-    def __init__(self, endpoint_state: EndpointState, batch_size=1000):
-        self.state = endpoint_state
+    def __init__(self, endpoint: Endpoint, batch_size=1000):
+        self.state = endpoint
         self.batch_size = batch_size
         self.error = None
-        self.harvest_identify_response = None
         self.metrics = MetricsLogger()
+        self.date_format = self.detect_date_format()
 
-    def get_earliest_datestamp(self) -> datetime.datetime:
+    def detect_date_format(self):
+        """
+        Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'.
+        """
+        try:
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
+            identify = my_sickle.Identify()
+            earliest = identify.earliestDatestamp
+
+            if 'T' in earliest:
+                LOGGER.info("Repository supports full timestamp format 'YYYY-MM-DDTHH:MM:SSZ'")
+                return '%Y-%m-%dT%H:%M:%SZ'
+            else:
+                LOGGER.info("Repository supports date-only format 'YYYY-MM-DD'")
+                return '%Y-%m-%d'
+        except Exception as e:
+            LOGGER.warning(f"Unable to determine date format; defaulting to 'YYYY-MM-DD': {e}")
+            return '%Y-%m-%d'
+
+    @contextmanager
+    def _get_s3_client(self):
+        client = boto3.client('s3')
+        try:
+            yield client
+        finally:
+            pass
+
+    def _validate_record(self, record: str) -> bool:
+        if not record.strip():
+            LOGGER.warning("Empty record found")
+            return False
+
+        try:
+            ET.fromstring(record)
+            return True
+        except ParseError as e:
+            LOGGER.warning(f"Invalid XML record: {str(e)}")
+            return False
+
+    def get_earliest_datestamp(self):
         if not self.state.pmh_url:
             LOGGER.warning("No PMH URL provided, returning default date")
-            return datetime.datetime(2000, 1, 1)
+            return datetime(2000, 1, 1)
 
         try:
             my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
@@ -171,83 +189,38 @@ class EndpointHarvester:
             if earliest:
                 try:
                     if 'T' in earliest:
-                        return datetime.datetime.strptime(earliest,
+                        return datetime.strptime(earliest,
                                                           '%Y-%m-%dT%H:%M:%SZ')
                     else:
-                        return datetime.datetime.strptime(earliest, '%Y-%m-%d')
+                        return datetime.strptime(earliest, '%Y-%m-%d')
                 except ValueError:
                     LOGGER.warning(
                         f"Could not parse earliest datestamp: {earliest}")
-                    return datetime.datetime(2000, 1, 1)
+                    return datetime(2000, 1, 1)
             else:
                 LOGGER.warning(
                     "No earliest datestamp found in Identify response")
-                return datetime.datetime(2000, 1, 1)
+                return datetime(2000, 1, 1)
 
         except Exception as e:
             LOGGER.error(f"Error getting earliest datestamp: {str(e)}")
-            return datetime.datetime(2000, 1, 1)
-
-    def harvest(self, s3_bucket: str, state_manager: StateManager, first=None,
-                last=None):
-        if not self.harvest_identify_response:
-            self.set_identify_and_initial_query()
-
-        if not first:
-            first = datetime.datetime(2000, 1, 1).date()
-        if not last:
-            last = datetime.datetime.utcnow().date()
-
-        self.state.last_harvest_started = datetime.datetime.utcnow().isoformat()
-        self.state.error = None
-        state_manager.update_endpoint_state(self.state)
-
-        try:
-            self.metrics.start()
-            self.call_pmh_endpoint(s3_bucket, first, last)
-
-            self.state.last_harvest_finished = datetime.datetime.utcnow().isoformat()
-            self.state.most_recent_year_harvested = last.isoformat()
-            self.state.error = None
-            self.state.retry_at = None
-
-        except Exception as e:
-            self.state.error = str(e)
-            retry_interval = datetime.timedelta(minutes=5)
-            if self.state.retry_at:
-                last_retry = datetime.datetime.fromisoformat(
-                    self.state.retry_at)
-                now = datetime.datetime.utcnow()
-                retry_interval = (last_retry - now) * 2
-
-            self.state.retry_at = (
-                        datetime.datetime.utcnow() + retry_interval).isoformat()
-            self.state.last_harvest_started = None
-
-        finally:
-            self.metrics.stop()
-            state_manager.update_endpoint_state(self.state)
-
-    def set_identify_and_initial_query(self):
-        if not self.state.pmh_url:
-            self.harvest_identify_response = "error, no pmh_url given"
-            return
-
-        try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
-            my_sickle.Identify()
-            self.harvest_identify_response = "SUCCESS!"
-        except Exception as e:
-            self.error = f"error in calling identify: {e.__class__.__name__} {str(e)}"
-            self.harvest_identify_response = self.error
+            return datetime(2000, 1, 1)
 
     def get_datetime_path(self, record):
+        """Get the date path for S3 storage"""
         datestamp = record.header.datestamp
-        dt = datetime.datetime.fromisoformat(datestamp.replace('Z', '+00:00'))
+        dt = parse_datestamp(datestamp)
         return f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
 
-    def save_batch(self, s3_client, s3_bucket, batch_number, records,
-                   first_record):
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+        retry=tenacity.retry_if_exception_type((BotoCoreError, ClientError)),
+        before=tenacity.before_log(LOGGER, logging.INFO),
+        after=tenacity.after_log(LOGGER, logging.INFO),
+        reraise=True
+    )
+    def save_batch(self, s3_client, s3_bucket, batch_number, records, first_record):
         try:
             date_path = self.get_datetime_path(first_record)
             root = ET.Element('oai_records')
@@ -259,53 +232,108 @@ class EndpointHarvester:
             xml_content = ET.tostring(root, encoding='unicode', method='xml')
             compressed_content = gzip.compress(xml_content.encode('utf-8'))
 
-            timestamp = int(datetime.datetime.fromisoformat(
-                first_record.header.datestamp.replace('Z',
-                                                      '+00:00')).timestamp())
-
+            timestamp = int(parse_datestamp(first_record.header.datestamp).timestamp())
             object_key = f"repositories/{self.state.id}/{date_path}/page_{batch_number}_{timestamp}.xml.gz"
+
+            metadata = {
+                'record_count': str(len(records)),
+                'batch_number': str(batch_number),
+                'timestamp': datetime.now(UTC).isoformat()
+            }
 
             s3_client.put_object(
                 Bucket=s3_bucket,
                 Key=object_key,
                 Body=compressed_content,
-                ContentType='application/x-gzip'
+                ContentType='application/x-gzip',
+                Metadata=metadata
             )
 
             LOGGER.info(f"Uploaded batch {batch_number} to {object_key}")
 
         except Exception as e:
             LOGGER.exception(f"Error saving batch {batch_number}")
-            self.error = f"Error saving batch: {str(e)}"
+            self.state.error = f"Error saving batch: {str(e)}"
             raise
 
-    def call_pmh_endpoint(self, s3_bucket, first, last):
-        s3_client = boto3.client('s3')
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+        retry=tenacity.retry_if_exception_type(requests.exceptions.RequestException),
+        before=tenacity.before_log(LOGGER, logging.INFO),
+        after=tenacity.after_log(LOGGER, logging.INFO)
+    )
+    def _make_oai_request(self, sickle, **kwargs):
+        """Wrapper for OAI-PMH requests with retry logic"""
+        return sickle.ListRecords(**kwargs)
+
+    def harvest(self, s3_bucket, state_manager: StateManager, first=None, last=None):
+        """
+        Harvest records from the endpoint, ensuring complete daily ingestion.
+        """
+        first = first or datetime(2000, 1, 1).date()  # default to 2000-01-01 if no `first` date provided
+        if isinstance(first, datetime):
+            first = first.date()
+        if isinstance(last, datetime):
+            last = last.date()
+
+        LOGGER.info(f"Harvesting from {first} 00:00:00 UTC to {last} 23:59:59 UTC")
+
+        self.state.last_harvest_started = datetime.now(UTC)
+        self.state.error = None
+        state_manager.update_endpoint_state(self.state)
+
+        try:
+            self.metrics.start()
+            with self._get_s3_client() as s3_client:
+                current_date = first
+                while current_date <= last:
+                    next_date = current_date + timedelta(days=1)
+                    self.call_pmh_endpoint(s3_client, s3_bucket, current_date, next_date - timedelta(seconds=1))
+                    current_date = next_date
+
+            self.state.last_harvest_finished = datetime.now(UTC)
+            self.state.most_recent_date_harvested = last
+            self.state.error = None
+            self.state.retry_at = None
+            self.state.retry_interval = timedelta(minutes=5)
+        except Exception as e:
+            self.state.error = str(e)
+            base_retry_interval = timedelta(minutes=5)
+            retry_interval = self.state.retry_interval or base_retry_interval
+            self.state.retry_at = datetime.now(UTC) + retry_interval
+            self.state.retry_interval = retry_interval * 2
+        finally:
+            self.metrics.stop()
+            state_manager.update_endpoint_state(self.state)
+
+    def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
+        from_date = first.strftime(self.date_format)
+        until_date = last.strftime(self.date_format)
 
         args = {
             'metadataPrefix': self.state.metadata_prefix,
-            'from': first.isoformat()[0:10],
-            'until': last.isoformat()[0:10]
+            'from': from_date,
+            'until': until_date
         }
 
         if self.state.pmh_set:
             args["set"] = self.state.pmh_set
 
-        try:
-            my_sickle = _get_my_sickle(self.state.pmh_url)
-            records = my_sickle.ListRecords(**args)
+        LOGGER.info(f"OAI-PMH request parameters: {args}")
 
-            # Get total records from first page if available
+        try:
+            my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics)
+            records = self._make_oai_request(my_sickle, **args)
+
             if hasattr(records._items, 'oai_response'):
                 resumption_token_element = records._items.oai_response.xml.find(
                     './/' + records._items.sickle.oai_namespace + 'resumptionToken')
                 if resumption_token_element is not None:
-                    complete_list_size = resumption_token_element.attrib.get(
-                        'completeListSize')
+                    complete_list_size = resumption_token_element.attrib.get('completeListSize')
                     if complete_list_size:
                         self.metrics.total_records = int(complete_list_size)
-                        LOGGER.info(
-                            f"Total records to harvest: {self.metrics.total_records}")
+                        LOGGER.info(f"Total records to harvest: {self.metrics.total_records}")
 
             current_batch = []
             batch_number = 1
@@ -321,22 +349,23 @@ class EndpointHarvester:
                 current_batch.append(record)
 
                 if len(current_batch) >= self.batch_size:
-                    self.save_batch(s3_client, s3_bucket, batch_number,
-                                    current_batch, first_record_in_batch)
-                    current_batch = []
+                    self.save_batch(s3_client, s3_bucket, batch_number, current_batch, first_record_in_batch)
+
+                    # clear the current batch and reset tracking variables
+                    current_batch.clear()
                     first_record_in_batch = None
                     batch_number += 1
 
-            if current_batch:
-                self.save_batch(s3_client, s3_bucket, batch_number,
-                                current_batch, first_record_in_batch)
+            if current_batch and first_record_in_batch:
+                self.save_batch(s3_client, s3_bucket, batch_number, current_batch, first_record_in_batch)
 
         except NoRecordsMatch:
-            LOGGER.info(
-                f"No records found for {self.state.pmh_url} with args {args}")
+            LOGGER.info(f"No records found for {self.state.pmh_url} with args {args}")
+
         except Exception as e:
-            self.error = f"Error harvesting records: {str(e)}"
+            self.state.error = f"Error harvesting records: {str(e)}"
             LOGGER.exception(f"Error harvesting from {self.state.pmh_url}")
+            raise
 
 
 class MyOAIItemIterator(OAIItemIterator):
@@ -366,6 +395,7 @@ class MySickle(Sickle):
 
     def __init__(self, *args, **kwargs):
         self.metrics_logger = None
+        self.http_method = kwargs.get('http_method', 'GET')
         kwargs['max_retries'] = 5
         super(MySickle, self).__init__(*args, **kwargs)
 
@@ -373,7 +403,6 @@ class MySickle(Sickle):
         self.metrics_logger = metrics_logger
 
     def harvest(self, **kwargs):
-        start_time = time()
         headers = {'User-Agent': 'OAIHarvester/1.0'}
 
         for _ in range(self.max_retries):
@@ -385,6 +414,11 @@ class MySickle(Sickle):
                     http_response = requests.get(url, headers=headers,
                                                   data=kwargs,
                                                   **self.request_args)
+                    if self.metrics_logger:
+                        self.metrics_logger.update_url(http_response.url)
+
+                else:
+                    http_response = requests.post(self.endpoint, headers=headers, data=kwargs, **self.request_args)
                     if self.metrics_logger:
                         self.metrics_logger.update_url(http_response.url)
 
@@ -419,7 +453,7 @@ class MySickle(Sickle):
         raise Exception(f"Failed to harvest after {self.max_retries} retries")
 
 
-def _get_my_sickle(repo_pmh_url, timeout=120):
+def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=120):
     if not repo_pmh_url:
         return None
 
@@ -429,91 +463,73 @@ def _get_my_sickle(repo_pmh_url, timeout=120):
         proxy_url = os.getenv("STATIC_IP_PROXY")
 
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else {}
-    sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout,
-                    iterator=MyOAIItemIterator)
+    sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=MyOAIItemIterator)
 
-    frame = inspect.currentframe()
-    try:
-        while frame:
-            if 'self' in frame.f_locals and isinstance(frame.f_locals['self'], EndpointHarvester):
-                harvester = frame.f_locals['self']
-                sickle.set_metrics_logger(harvester.metrics)
-                break
-            frame = frame.f_back
-    finally:
-        del frame  # Avoid reference cycles
+    if metrics_logger:
+        sickle.set_metrics_logger(metrics_logger)
 
     return sickle
 
 
-def parse_date(date_str: str) -> datetime.datetime:
+def parse_date(date_str: str):
     try:
-        return datetime.datetime.strptime(date_str, '%Y-%m-%d')
+        return datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"Invalid date format: {date_str}. Use YYYY-MM-DD")
 
 
+def parse_datestamp(datestamp_str):
+    try:
+        if 'T' in datestamp_str:
+            return datetime.strptime(datestamp_str, '%Y-%m-%dT%H:%M:%SZ')
+        else:
+            return datetime.strptime(datestamp_str, '%Y-%m-%d')
+    except ValueError:
+        LOGGER.warning(f"Could not parse datestamp: {datestamp_str}")
+        return datetime(2000, 1, 1)
+
+
+
 def main():
     parser = argparse.ArgumentParser(description='OAI-PMH Repository Harvester')
 
-    parser.add_argument('--endpoint-id',
-                        help='Specific endpoint ID to harvest')
-
-    parser.add_argument('--start-date',
-                        type=parse_date,
-                        help='Start date in YYYY-MM-DD format. If not provided, uses state file date')
-
-    parser.add_argument('--use-earliest',
-                        action='store_true',
-                        help='Use earliest date available from repository')
-
-    parser.add_argument('--end-date',
-                        type=parse_date,
-                        help='End date in YYYY-MM-DD format. If not provided, uses current date')
+    parser.add_argument('--endpoint-id', help='Specific endpoint ID to harvest')
+    parser.add_argument('--start-date', type=parse_date, help='Start date in YYYY-MM-DD format.')
+    parser.add_argument('--end-date', type=parse_date, help='End date in YYYY-MM-DD format.')
+    parser.add_argument('--core-endpoints', action='store_true', help='Harvest core metadata only')
 
     args = parser.parse_args()
 
-    if args.start_date and args.use_earliest:
-        parser.error("Cannot specify both --start-date and --use-earliest")
-
-    state_manager = StateManager(bucket=S3_BUCKET)
+    state_manager = StateManager()
 
     if args.endpoint_id:
-        # Run single endpoint
-        endpoint_state = state_manager.get_endpoint(args.endpoint_id)
-        if not endpoint_state:
+        endpoint = state_manager.get_endpoint(args.endpoint_id)
+        if not endpoint:
             print(f"No endpoint found with ID: {args.endpoint_id}")
             return
-        endpoints = [endpoint_state]
+        endpoints = [endpoint]
     else:
-        # Run all ready endpoints
-        endpoints = state_manager.get_ready_endpoints()
+        endpoints = state_manager.get_ready_endpoints(args.core_endpoints)
         print(f"Found {len(endpoints)} endpoints ready to harvest")
 
-    for endpoint_state in endpoints:
-        print(f"\nProcessing endpoint: {endpoint_state.pmh_url}")
-        harvester = EndpointHarvester(endpoint_state)
+    for endpoint in endpoints:
+        print(f"\nProcessing endpoint: {endpoint.pmh_url}")
+        harvester = EndpointHarvester(endpoint)
 
-        first_date = None
-        if args.use_earliest:
-            first_date = harvester.get_earliest_datestamp()
-            print(f"Using earliest repository date: {first_date}")
-        elif args.start_date:
+        if args.start_date:
             first_date = args.start_date
-            print(f"Using specified start date: {first_date}")
+        else:
+            first_date = (
+                endpoint.most_recent_date_harvested.date() - timedelta(days=1)
+                if endpoint.most_recent_date_harvested
+                else harvester.get_earliest_datestamp().date()
+                     or datetime(2000, 1, 1).date()
+            )
 
-        last_date = args.end_date
-        if last_date:
-            print(f"Using specified end date: {last_date}")
+        last_date = args.end_date or (datetime.now(UTC).date() - timedelta(days=1))
 
-        harvester.harvest(
-            s3_bucket=S3_BUCKET,
-            state_manager=state_manager,
-            first=first_date,
-            last=last_date
-        )
-
+        harvester.harvest(s3_bucket=S3_BUCKET, state_manager=state_manager, first=first_date, last=last_date)
 
 if __name__ == "__main__":
     main()
