@@ -1,6 +1,6 @@
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 import gzip
 import logging
 import os
@@ -70,7 +70,7 @@ class StateManager:
         db.commit()
 
     def get_ready_endpoints(self, core_endpoints=False) -> List[Endpoint]:
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         ready_endpoints = db.query(Endpoint).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
@@ -238,7 +238,7 @@ class EndpointHarvester:
             metadata = {
                 'record_count': str(len(records)),
                 'batch_number': str(batch_number),
-                'timestamp': datetime.now(UTC).isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
 
             s3_client.put_object(
@@ -277,9 +277,9 @@ class EndpointHarvester:
         if isinstance(last, datetime):
             last = last.date()
 
-        LOGGER.info(f"Harvesting from {first} 00:00:00 UTC to {last} 23:59:59 UTC")
+        LOGGER.info(f"Harvesting from {first} 00:00:00 timezone.utc to {last} 23:59:59 timezone.utc")
 
-        self.state.last_harvest_started = datetime.now(UTC)
+        self.state.last_harvest_started = datetime.now(timezone.utc)
         self.state.error = None
         state_manager.update_endpoint_state(self.state)
 
@@ -292,7 +292,7 @@ class EndpointHarvester:
                     self.call_pmh_endpoint(s3_client, s3_bucket, current_date, next_date - timedelta(seconds=1))
                     current_date = next_date
 
-            self.state.last_harvest_finished = datetime.now(UTC)
+            self.state.last_harvest_finished = datetime.now(timezone.utc)
             self.state.most_recent_date_harvested = last
             self.state.error = None
             self.state.retry_at = None
@@ -301,7 +301,7 @@ class EndpointHarvester:
             self.state.error = str(e)
             base_retry_interval = timedelta(minutes=5)
             retry_interval = self.state.retry_interval or base_retry_interval
-            self.state.retry_at = datetime.now(UTC) + retry_interval
+            self.state.retry_at = datetime.now(timezone.utc) + retry_interval
             self.state.retry_interval = retry_interval * 2
         finally:
             self.metrics.stop()
@@ -527,7 +527,7 @@ def main():
                      or datetime(2000, 1, 1).date()
             )
 
-        last_date = args.end_date or (datetime.now(UTC).date() - timedelta(days=1))
+        last_date = args.end_date or (datetime.now(timezone.utc).date() - timedelta(days=1))
 
         harvester.harvest(s3_bucket=S3_BUCKET, state_manager=state_manager, first=first_date, last=last_date)
 
