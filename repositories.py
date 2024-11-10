@@ -225,9 +225,16 @@ class EndpointHarvester:
             date_path = self.get_datetime_path(first_record)
             root = ET.Element('oai_records')
 
+            most_recent_date = parse_datestamp(first_record.header.datestamp)
+
             for record in records:
                 record_elem = ET.fromstring(record.raw)
                 root.append(record_elem)
+
+                # check if this record's date is more recent
+                record_date = parse_datestamp(record.header.datestamp)
+                if record_date > most_recent_date:
+                    most_recent_date = record_date
 
             xml_content = ET.tostring(root, encoding='unicode', method='xml')
             compressed_content = gzip.compress(xml_content.encode('utf-8'))
@@ -250,6 +257,16 @@ class EndpointHarvester:
             )
 
             LOGGER.info(f"Uploaded batch {batch_number} to {object_key}")
+
+            # save checkpoint after every batch, using date - 1 day
+            checkpoint_date = most_recent_date - timedelta(days=1)
+            try:
+                self.state.most_recent_date_harvested = checkpoint_date
+                db.merge(self.state)
+                db.commit()
+                LOGGER.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
+            except Exception as e:
+                LOGGER.warning(f"Failed to save checkpoint: {e}")
 
         except Exception as e:
             LOGGER.exception(f"Error saving batch {batch_number}")
