@@ -137,153 +137,6 @@ class EndpointHarvester:
         self.metrics = MetricsLogger()
         self.date_format = self.detect_date_format()
 
-    def detect_date_format(self):
-        """
-        Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'.
-        """
-        try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
-            identify = my_sickle.Identify()
-            earliest = identify.earliestDatestamp
-
-            if 'T' in earliest:
-                LOGGER.info("Repository supports full timestamp format 'YYYY-MM-DDTHH:MM:SSZ'")
-                return '%Y-%m-%dT%H:%M:%SZ'
-            else:
-                LOGGER.info("Repository supports date-only format 'YYYY-MM-DD'")
-                return '%Y-%m-%d'
-        except Exception as e:
-            LOGGER.warning(f"Unable to determine date format; defaulting to 'YYYY-MM-DD': {e}")
-            return '%Y-%m-%d'
-
-    @contextmanager
-    def _get_s3_client(self):
-        client = boto3.client('s3')
-        try:
-            yield client
-        finally:
-            pass
-
-    def _validate_record(self, record: str) -> bool:
-        if not record.strip():
-            LOGGER.warning("Empty record found")
-            return False
-
-        try:
-            ET.fromstring(record)
-            return True
-        except ParseError as e:
-            LOGGER.warning(f"Invalid XML record: {str(e)}")
-            return False
-
-    def get_earliest_datestamp(self):
-        if not self.state.pmh_url:
-            LOGGER.warning("No PMH URL provided, returning default date")
-            return datetime(2000, 1, 1)
-
-        try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
-            identify = my_sickle.Identify()
-            earliest = identify.earliestDatestamp
-
-            if earliest:
-                try:
-                    if 'T' in earliest:
-                        return datetime.strptime(earliest,
-                                                          '%Y-%m-%dT%H:%M:%SZ')
-                    else:
-                        return datetime.strptime(earliest, '%Y-%m-%d')
-                except ValueError:
-                    LOGGER.warning(
-                        f"Could not parse earliest datestamp: {earliest}")
-                    return datetime(2000, 1, 1)
-            else:
-                LOGGER.warning(
-                    "No earliest datestamp found in Identify response")
-                return datetime(2000, 1, 1)
-
-        except Exception as e:
-            LOGGER.error(f"Error getting earliest datestamp: {str(e)}")
-            return datetime(2000, 1, 1)
-
-    def get_datetime_path(self, record):
-        """Get the date path for S3 storage"""
-        datestamp = record.header.datestamp
-        dt = parse_datestamp(datestamp)
-        return f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
-
-    @tenacity.retry(
-        stop=tenacity.stop_after_attempt(3),
-        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
-        retry=tenacity.retry_if_exception_type((BotoCoreError, ClientError)),
-        before=tenacity.before_log(LOGGER, logging.INFO),
-        after=tenacity.after_log(LOGGER, logging.INFO),
-        reraise=True
-    )
-    def save_batch(self, s3_client, s3_bucket, batch_number, records, first_record):
-        try:
-            date_path = self.get_datetime_path(first_record)
-            root = ET.Element('oai_records')
-
-            most_recent_date = parse_datestamp(first_record.header.datestamp)
-
-            for record in records:
-                record_elem = ET.fromstring(record.raw)
-                root.append(record_elem)
-
-                # check if this record's date is more recent
-                record_date = parse_datestamp(record.header.datestamp)
-                if record_date > most_recent_date:
-                    most_recent_date = record_date
-
-            xml_content = ET.tostring(root, encoding='unicode', method='xml')
-            compressed_content = gzip.compress(xml_content.encode('utf-8'))
-
-            timestamp = int(parse_datestamp(first_record.header.datestamp).timestamp())
-            object_key = f"repositories/{self.state.id}/{date_path}/page_{batch_number}_{timestamp}.xml.gz"
-
-            metadata = {
-                'record_count': str(len(records)),
-                'batch_number': str(batch_number),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
-
-            s3_client.put_object(
-                Bucket=s3_bucket,
-                Key=object_key,
-                Body=compressed_content,
-                ContentType='application/x-gzip',
-                Metadata=metadata
-            )
-
-            LOGGER.info(f"Uploaded batch {batch_number} to {object_key}")
-
-            # save checkpoint after every batch, using date - 1 day
-            checkpoint_date = most_recent_date - timedelta(days=1)
-            try:
-                self.state.most_recent_date_harvested = checkpoint_date
-                db.merge(self.state)
-                db.commit()
-                LOGGER.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
-            except Exception as e:
-                LOGGER.warning(f"Failed to save checkpoint: {e}")
-
-        except Exception as e:
-            LOGGER.exception(f"Error saving batch {batch_number}")
-            self.state.error = f"Error saving batch: {str(e)}"
-            raise
-
-    @tenacity.retry(
-        stop=tenacity.stop_after_attempt(3),
-        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
-        retry=tenacity.retry_if_exception_type(requests.exceptions.RequestException),
-        before=tenacity.before_log(LOGGER, logging.INFO),
-        after=tenacity.after_log(LOGGER, logging.INFO)
-    )
-    def _make_oai_request(self, sickle, **kwargs):
-        """Wrapper for OAI-PMH requests with retry logic"""
-        return sickle.ListRecords(**kwargs)
-
     def harvest(self, s3_bucket, state_manager: StateManager, first=None, last=None):
         """
         Harvest records from the endpoint, ensuring complete daily ingestion.
@@ -384,6 +237,153 @@ class EndpointHarvester:
             LOGGER.exception(f"Error harvesting from {self.state.pmh_url}")
             raise
 
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+        retry=tenacity.retry_if_exception_type((BotoCoreError, ClientError)),
+        before=tenacity.before_log(LOGGER, logging.INFO),
+        after=tenacity.after_log(LOGGER, logging.INFO),
+        reraise=True
+    )
+    def save_batch(self, s3_client, s3_bucket, batch_number, records, first_record):
+        try:
+            date_path = self.get_datetime_path(first_record)
+            root = ET.Element('oai_records')
+
+            most_recent_date = parse_datestamp(first_record.header.datestamp)
+
+            for record in records:
+                record_elem = ET.fromstring(record.raw)
+                root.append(record_elem)
+
+                # check if this record's date is more recent
+                record_date = parse_datestamp(record.header.datestamp)
+                if record_date > most_recent_date:
+                    most_recent_date = record_date
+
+            xml_content = ET.tostring(root, encoding='unicode', method='xml')
+            compressed_content = gzip.compress(xml_content.encode('utf-8'))
+
+            timestamp = int(parse_datestamp(first_record.header.datestamp).timestamp())
+            object_key = f"repositories/{self.state.id}/{date_path}/page_{batch_number}_{timestamp}.xml.gz"
+
+            metadata = {
+                'record_count': str(len(records)),
+                'batch_number': str(batch_number),
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+
+            s3_client.put_object(
+                Bucket=s3_bucket,
+                Key=object_key,
+                Body=compressed_content,
+                ContentType='application/x-gzip',
+                Metadata=metadata
+            )
+
+            LOGGER.info(f"Uploaded batch {batch_number} to {object_key}")
+
+            # save checkpoint after every batch, using date - 1 day
+            checkpoint_date = most_recent_date - timedelta(days=1)
+            try:
+                self.state.most_recent_date_harvested = checkpoint_date
+                db.merge(self.state)
+                db.commit()
+                LOGGER.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
+            except Exception as e:
+                LOGGER.warning(f"Failed to save checkpoint: {e}")
+
+        except Exception as e:
+            LOGGER.exception(f"Error saving batch {batch_number}")
+            self.state.error = f"Error saving batch: {str(e)}"
+            raise
+
+    @contextmanager
+    def _get_s3_client(self):
+        client = boto3.client('s3')
+        try:
+            yield client
+        finally:
+            pass
+
+    def detect_date_format(self):
+        """
+        Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'.
+        """
+        try:
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
+            identify = my_sickle.Identify()
+            earliest = identify.earliestDatestamp
+
+            if 'T' in earliest:
+                LOGGER.info("Repository supports full timestamp format 'YYYY-MM-DDTHH:MM:SSZ'")
+                return '%Y-%m-%dT%H:%M:%SZ'
+            else:
+                LOGGER.info("Repository supports date-only format 'YYYY-MM-DD'")
+                return '%Y-%m-%d'
+        except Exception as e:
+            LOGGER.warning(f"Unable to determine date format; defaulting to 'YYYY-MM-DD': {e}")
+            return '%Y-%m-%d'
+
+    def _validate_record(self, record: str) -> bool:
+        if not record.strip():
+            LOGGER.warning("Empty record found")
+            return False
+
+        try:
+            ET.fromstring(record)
+            return True
+        except ParseError as e:
+            LOGGER.warning(f"Invalid XML record: {str(e)}")
+            return False
+
+    def get_earliest_datestamp(self):
+        if not self.state.pmh_url:
+            LOGGER.warning("No PMH URL provided, returning default date")
+            return datetime(2000, 1, 1)
+
+        try:
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
+            identify = my_sickle.Identify()
+            earliest = identify.earliestDatestamp
+
+            if earliest:
+                try:
+                    if 'T' in earliest:
+                        return datetime.strptime(earliest,
+                                                          '%Y-%m-%dT%H:%M:%SZ')
+                    else:
+                        return datetime.strptime(earliest, '%Y-%m-%d')
+                except ValueError:
+                    LOGGER.warning(
+                        f"Could not parse earliest datestamp: {earliest}")
+                    return datetime(2000, 1, 1)
+            else:
+                LOGGER.warning(
+                    "No earliest datestamp found in Identify response")
+                return datetime(2000, 1, 1)
+
+        except Exception as e:
+            LOGGER.error(f"Error getting earliest datestamp: {str(e)}")
+            return datetime(2000, 1, 1)
+
+    def get_datetime_path(self, record):
+        """Get the date path for S3 storage"""
+        datestamp = record.header.datestamp
+        dt = parse_datestamp(datestamp)
+        return f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
+
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+        retry=tenacity.retry_if_exception_type(requests.exceptions.RequestException),
+        before=tenacity.before_log(LOGGER, logging.INFO),
+        after=tenacity.after_log(LOGGER, logging.INFO)
+    )
+    def _make_oai_request(self, sickle, **kwargs):
+        """Wrapper for OAI-PMH requests with retry logic"""
+        return sickle.ListRecords(**kwargs)
+
 
 class MyOAIItemIterator(OAIItemIterator):
     def _get_resumption_token(self):
@@ -408,12 +408,12 @@ class MyOAIItemIterator(OAIItemIterator):
 
 
 class MySickle(Sickle):
-    RETRY_SECONDS = 120
+    DEFAULT_RETRY_SECONDS = 5
 
     def __init__(self, *args, **kwargs):
         self.metrics_logger = None
         self.http_method = kwargs.get('http_method', 'GET')
-        kwargs['max_retries'] = 5
+        kwargs['max_retries'] = kwargs.get('max_retries', 10)
         super(MySickle, self).__init__(*args, **kwargs)
 
     def set_metrics_logger(self, metrics_logger):
@@ -421,51 +421,51 @@ class MySickle(Sickle):
 
     def harvest(self, **kwargs):
         headers = {'User-Agent': 'OAIHarvester/1.0'}
+        retry_wait = self.DEFAULT_RETRY_SECONDS
 
-        for _ in range(self.max_retries):
+        for attempt in range(self.max_retries):
             try:
                 if self.http_method == 'GET':
-                    payload_str = "&".join(
-                        f"{k}={v}" for k, v in kwargs.items())
+                    payload_str = "&".join(f"{k}={v}" for k, v in kwargs.items())
                     url = f"{self.endpoint}?{payload_str}"
-                    http_response = requests.get(url, headers=headers,
-                                                  data=kwargs,
-                                                  **self.request_args)
-                    if self.metrics_logger:
-                        self.metrics_logger.update_url(http_response.url)
-
+                    http_response = requests.get(url, headers=headers, **self.request_args)
                 else:
                     http_response = requests.post(self.endpoint, headers=headers, data=kwargs, **self.request_args)
-                    if self.metrics_logger:
-                        self.metrics_logger.update_url(http_response.url)
 
+                if self.metrics_logger:
+                    self.metrics_logger.update_url(http_response.url)
+
+                # handle 503 errors with Retry-After header or exponential backoff
                 if http_response.status_code == 503:
-                    retry_after = int(http_response.headers.get('Retry-After',
-                                                                self.RETRY_SECONDS))
-                    LOGGER.info(
-                        f"HTTP 503! Retrying after {retry_after} seconds...")
-                    sleep(retry_after)
+                    retry_after = http_response.headers.get('Retry-After')
+                    if retry_after:
+                        retry_wait = int(retry_after)
+                    else:
+                        retry_wait = min(retry_wait * 2, 60)  # cap exponential backoff at 60 seconds
+                    LOGGER.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
+                    sleep(retry_wait)
                     continue
 
                 http_response.raise_for_status()
 
+                # validate response content
                 if not http_response.text.strip():
                     raise Exception("Empty response received from server")
-
                 if not http_response.text.strip().startswith('<?xml'):
-                    raise Exception(
-                        f"Invalid XML response: {http_response.text[:100]}")
+                    raise Exception(f"Invalid XML response: {http_response.text[:100]}")
 
                 if self.encoding:
                     http_response.encoding = self.encoding
 
+                # successful response
                 return OAIResponse(http_response, params=kwargs)
 
             except Exception as e:
                 LOGGER.error(f"Error harvesting from {self.endpoint}: {str(e)}")
-                if _ == self.max_retries - 1:  # Last retry
+                if attempt == self.max_retries - 1:
                     raise
-                sleep(self.RETRY_SECONDS)
+                LOGGER.info(f"Retrying after {retry_wait} seconds due to error...")
+                sleep(retry_wait)
 
         raise Exception(f"Failed to harvest after {self.max_retries} retries")
 
