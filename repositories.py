@@ -285,7 +285,7 @@ class EndpointHarvester:
 
             # save checkpoint after every batch, using date - 1 day
             checkpoint_date = most_recent_date - timedelta(days=1)
-            if checkpoint_date > self.state.most_recent_date_harvested:
+            if not self.state.most_recent_date_harvested or checkpoint_date > self.state.most_recent_date_harvested:
                 self.state.most_recent_date_harvested = checkpoint_date
                 db.merge(self.state)
                 db.commit()
