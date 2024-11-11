@@ -285,13 +285,11 @@ class EndpointHarvester:
 
             # save checkpoint after every batch, using date - 1 day
             checkpoint_date = most_recent_date - timedelta(days=1)
-            try:
+            if checkpoint_date > self.state.most_recent_date_harvested:
                 self.state.most_recent_date_harvested = checkpoint_date
                 db.merge(self.state)
                 db.commit()
                 LOGGER.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
-            except Exception as e:
-                LOGGER.warning(f"Failed to save checkpoint: {e}")
 
         except Exception as e:
             LOGGER.exception(f"Error saving batch {batch_number}")
