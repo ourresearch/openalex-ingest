@@ -14,7 +14,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from defusedxml.ElementTree import ParseError
 import requests
 import shortuuid
-from sickle import Sickle
+from sickle import Sickle, oaiexceptions
 from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
 from sickle.oaiexceptions import NoRecordsMatch
@@ -405,6 +405,35 @@ class MyOAIItemIterator(OAIItemIterator):
         )
 
 
+class OSTIItemIterator(MyOAIItemIterator):
+    def _next_response(self):
+        """Get the next response from the OAI server.
+
+        Special handling for OSTI which needs metadataPrefix included with resumptionToken.
+        """
+        params = self.params
+        if self.resumption_token:
+            params = {
+                'resumptionToken': self.resumption_token.token,
+                'verb': self.verb,
+                'metadataPrefix': params.get('metadataPrefix')  # Include metadataPrefix for OSTI
+            }
+        self.oai_response = self.sickle.harvest(**params)
+        error = self.oai_response.xml.find(
+            './/' + self.sickle.oai_namespace + 'error')
+        if error is not None:
+            code = error.attrib.get('code', 'UNKNOWN')
+            description = error.text or ''
+            try:
+                raise getattr(
+                    oaiexceptions, code[0].upper() + code[1:])(description)
+            except AttributeError:
+                raise oaiexceptions.OAIError(description)
+        self.resumption_token = self._get_resumption_token()
+        self._items = self.oai_response.xml.iterfind(
+            './/' + self.sickle.oai_namespace + self.element)
+
+
 class MySickle(Sickle):
     DEFAULT_RETRY_SECONDS = 5
 
@@ -478,7 +507,8 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=120):
         proxy_url = os.getenv("STATIC_IP_PROXY")
 
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else {}
-    sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=MyOAIItemIterator)
+    iterator = OSTIItemIterator if 'osti.gov/oai' in repo_pmh_url else MyOAIItemIterator
+    sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=iterator)
 
     if metrics_logger:
         sickle.set_metrics_logger(metrics_logger)
