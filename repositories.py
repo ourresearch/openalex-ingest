@@ -464,13 +464,17 @@ class MySickle(Sickle):
                 if self.metrics_logger:
                     self.metrics_logger.update_url(http_response.url)
 
-                # handle 503 errors with Retry-After header or exponential backoff
-                if http_response.status_code == 503:
+                if http_response.status_code == 422 and 'zenodo.org' in self.endpoint:
+                    LOGGER.info("Zenodo returned 422 - treating as no records available")
+                    empty_response = '<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><responseDate>2024-11-11T14:30:00Z</responseDate><request verb="ListRecords">' + self.endpoint + '</request><error code="noRecordsMatch">No matching records found</error></OAI-PMH>'
+                    http_response._content = empty_response.encode('utf-8')
+                    http_response.status_code = 200
+                elif http_response.status_code == 503:
                     retry_after = http_response.headers.get('Retry-After')
                     if retry_after:
                         retry_wait = int(retry_after)
                     else:
-                        retry_wait = min(retry_wait * 2, 60)  # cap exponential backoff at 60 seconds
+                        retry_wait = min(retry_wait * 2, 60)
                     LOGGER.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
                     sleep(retry_wait)
                     continue
