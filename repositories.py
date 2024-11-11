@@ -441,6 +441,8 @@ class MySickle(Sickle):
         self.metrics_logger = None
         self.http_method = kwargs.get('http_method', 'GET')
         kwargs['max_retries'] = kwargs.get('max_retries', 10)
+        if 'osti.gov/oai' in args[0]:
+            kwargs['timeout'] = (30, 300)
         super(MySickle, self).__init__(*args, **kwargs)
 
     def set_metrics_logger(self, metrics_logger):
