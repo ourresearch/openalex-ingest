@@ -38,8 +38,9 @@ class BatchTracker:
 class APIWorksIterator:
     BATCH_SIZE = 1000
 
-    def __init__(self, from_date, fetch_threads=10):
+    def __init__(self, from_date, end_date, fetch_threads=10):
         self.from_date = from_date
+        self.end_date = end_date
         self.fetch_threads = fetch_threads
         self.base_url = "https://api.datacite.org/works"
         self.page_size = 1000
@@ -56,9 +57,8 @@ class APIWorksIterator:
             params = {
                 'page[size]': self.page_size,
                 'page[number]': page,
-                'query': f'updated:[{self.from_date}T00:00:00Z TO *]',
-                'sort': 'updated',
-                'include': 'data-center,publisher,client,media,references,citations,predecessor-versions,successor-versions,contributors,affiliations'
+                'query': f'updated:[{self.from_date}T00:00:00Z TO {self.end_date}T23:59:59Z]',
+                'sort': 'updated'
             }
 
             response = requests.get(self.base_url, params=params)
@@ -75,7 +75,7 @@ class APIWorksIterator:
         params = {
             'page[size]': 1,
             'page[number]': 1,
-            'query': f'updated:[{self.from_date}T00:00:00Z TO *]',
+            'query': f'updated:[{self.from_date}T00:00:00Z TO {self.end_date}T23:59:59Z]',
             'sort': 'updated'
         }
 
@@ -258,18 +258,39 @@ if __name__ == "__main__":
     parser.add_argument('--from-date', default='2024-01-01')
     parser.add_argument('--update', action='store_true')
     parser.add_argument('--source', choices=['api', 'datafile'], default='api')
+    parser.add_argument('--backfill-from-api', action='store_true', help="Backfill from January 1, 2024 (snapshot end date)")
     args = parser.parse_args()
+
+    if args.backfill_from_api:
+        # temp function to backfill from API
+        start_date = datetime.strptime('2024-01-01', '%Y-%m-%d')
+        end_date = datetime.strptime('2024-11-12', '%Y-%m-%d')
+
+        current_date = start_date
+        while current_date <= end_date:
+            date_str = current_date.strftime('%Y-%m-%d')
+            LOGGER.info(f"Processing records for date: {date_str}")
+
+            works_iterator = APIWorksIterator(from_date=date_str, end_date=date_str, fetch_threads=args.fetch_threads)
+
+            harvest_works(works_iterator, args.upload_threads)
+
+            current_date += timedelta(days=1)
+
+        LOGGER.info("Completed backfill for the specified date range.")
+        exit()
 
     if args.source == 'api':
         if args.update:
-            from_date = (datetime.now() - timedelta(days=1)).strftime(
-                '%Y-%m-%d')
+            from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            end_date = datetime.now().strftime('%Y-%m-%d')
             LOGGER.info(
                 f"Running in update mode. Fetching works updated since {from_date}")
         else:
             from_date = args.from_date
+            end_date = datetime.now().strftime('%Y-%m-%d')
 
-        works_iterator = APIWorksIterator(from_date, args.fetch_threads)
+        works_iterator = APIWorksIterator(from_date, end_date, args.fetch_threads)
     else:
         works_iterator = DatafileWorksIterator()
 
