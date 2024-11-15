@@ -42,7 +42,7 @@ class APIWorksIterator:
         self.from_date = from_date
         self.end_date = end_date
         self.fetch_threads = fetch_threads
-        self.base_url = "https://api.datacite.org/works"
+        self.base_url = "https://api.datacite.org/dois"
         self.page_size = 1000
 
     @retry(stop=stop_after_attempt(5),
@@ -263,7 +263,7 @@ if __name__ == "__main__":
 
     if args.backfill_from_api:
         # temp function to backfill from API
-        start_date = datetime.strptime('2024-09-25', '%Y-%m-%d')
+        start_date = datetime.strptime('2024-01-01', '%Y-%m-%d')
         end_date = datetime.strptime('2024-11-12', '%Y-%m-%d')
 
         current_date = start_date
