@@ -263,8 +263,8 @@ if __name__ == "__main__":
 
     if args.backfill_from_api:
         # temp function to backfill from API
-        start_date = datetime.strptime('2024-06-12', '%Y-%m-%d')
-        end_date = datetime.strptime('2024-11-12', '%Y-%m-%d')
+        start_date = datetime.strptime('2024-11-12', '%Y-%m-%d')
+        end_date = datetime.strptime('2024-11-14', '%Y-%m-%d')
 
         current_date = start_date
         while current_date <= end_date:
