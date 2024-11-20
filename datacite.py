@@ -52,7 +52,7 @@ def upload_to_s3(date_path, batch_number, works):
     Upload a batch of works to S3 in a date-based directory.
     """
     timestamp = int(datetime.now().timestamp())
-    object_key = f"datacite/works-new/{date_path}/batch_{batch_number}_{timestamp}.json.gz"
+    object_key = f"datacite/works/{date_path}/batch_{batch_number}_{timestamp}.json.gz"
     compressed_data = compress_json(works)
     s3_client.put_object(
         Bucket=S3_BUCKET,
