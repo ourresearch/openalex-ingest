@@ -125,6 +125,7 @@ if __name__ == "__main__":
     parser.add_argument("--from-date", help="Start date (YYYY-MM-DD).")
     parser.add_argument("--to-date", help="End date (YYYY-MM-DD).")
     parser.add_argument("--yesterday", action="store_true", help="Fetch records from the last 24 hours.")
+    parser.add_argument("--backfill", action="store_true", help="Backfill records.")
     args = parser.parse_args()
 
     if args.yesterday:
@@ -133,6 +134,15 @@ if __name__ == "__main__":
         from_date = previous_day.strftime("%Y-%m-%d")
         to_date = previous_day.strftime("%Y-%m-%d")
         LOGGER.info(f"--today argument provided. Fetching updates for {from_date} (full day).")
+    elif args.backfill:
+        # go from 2024-11-01 to 2024-11-18, setting the from and to date to the same date and iterating through the days
+        from_date = "2024-11-01"
+        to_date = "2024-11-18"
+
+        # for each date, call the harvest_datacite_works function
+        while from_date <= to_date:
+            harvest_datacite_works(from_date, from_date)
+            from_date = (datetime.strptime(from_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     elif args.from_date and args.to_date:
         from_date = args.from_date
         to_date = args.to_date
