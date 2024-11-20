@@ -1,12 +1,13 @@
-import requests
-import boto3
-import json
-import logging
 import argparse
 from datetime import datetime, timedelta
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 import gzip
 from io import BytesIO
+import json
+import logging
+
+import boto3
+import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("datacite_harvester")
