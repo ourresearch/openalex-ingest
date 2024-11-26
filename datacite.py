@@ -85,7 +85,7 @@ def harvest_datacite_works(from_date, to_date):
 
     # Start with initial cursor
     cursor_url = (
-        f"{BASE_URL}?page[cursor]=1&page[size]={BATCH_SIZE}&query=updated:[{from_date}T00:00:00Z TO {to_date}T23:59:59Z]&sort=updated"
+        f"{BASE_URL}?page[cursor]=1&page[size]={BATCH_SIZE}&query=updated:[{from_date}T00:00:00Z TO {to_date}T23:59:59Z]&sort=updated&affiliation=true&publisher=true"
     )
 
     total_records = 0
@@ -137,7 +137,7 @@ if __name__ == "__main__":
     elif args.backfill:
         # go from 2024-11-01 to 2024-11-18, setting the from and to date to the same date and iterating through the days
         from_date = "2024-11-01"
-        to_date = "2024-11-18"
+        to_date = "2024-11-26"
 
         # for each date, call the harvest_datacite_works function
         while from_date <= to_date:
