@@ -52,6 +52,7 @@ class Endpoint(Base):
     retry_interval = Column(Interval)
     retry_at = Column(DateTime)
     is_core = Column(Boolean)
+    in_walden = Column(Boolean)
 
     def __init__(self, **kwargs):
         super(self.__class__, self).__init__(**kwargs)
@@ -69,12 +70,25 @@ class StateManager:
         db.merge(state)
         db.commit()
 
-    def get_ready_endpoints(self, core_endpoints=False) -> List[Endpoint]:
+    @staticmethod
+    def get_core_endpoints() -> List[Endpoint]:
         now = datetime.now(timezone.utc)
         ready_endpoints = db.query(Endpoint).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.is_core == core_endpoints
+            Endpoint.is_core == True,
+            Endpoint.in_walden == True
+        ).all()
+        return ready_endpoints
+
+    @staticmethod
+    def get_other_endpoints() -> List[Endpoint]:
+        now = datetime.now(timezone.utc)
+        ready_endpoints = db.query(Endpoint).filter(
+            Endpoint.ready_to_run == True,
+            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+            or_(Endpoint.is_core == False, Endpoint.is_core == None),
+            Endpoint.in_walden == True
         ).all()
         return ready_endpoints
 
@@ -560,8 +574,11 @@ def main():
             print(f"No endpoint found with ID: {args.endpoint_id}")
             return
         endpoints = [endpoint]
+    elif args.core_endpoints:
+        endpoints = state_manager.get_core_endpoints()
+        print(f"Found {len(endpoints)} core endpoints ready to harvest")
     else:
-        endpoints = state_manager.get_ready_endpoints(args.core_endpoints)
+        endpoints = state_manager.get_other_endpoints()
         print(f"Found {len(endpoints)} endpoints ready to harvest")
 
     for endpoint in endpoints:
