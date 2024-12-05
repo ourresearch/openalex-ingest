@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import gzip
@@ -93,6 +94,18 @@ class StateManager:
         return ready_endpoints
 
 
+thread_local = threading.local()
+
+def get_thread_logger():
+    if not hasattr(thread_local, "logger"):
+        thread_local.logger = logging.getLogger(f"harvester.{threading.current_thread().name}")
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        thread_local.logger.addHandler(handler)
+        thread_local.logger.setLevel(logging.INFO)
+    return thread_local.logger
+
 class MetricsLogger:
     def __init__(self, interval=5):
         self.interval = interval
@@ -104,6 +117,7 @@ class MetricsLogger:
         self.lock = threading.Lock()
         self.thread = None
         self.total_records = None
+        self.logger = get_thread_logger()
 
     def start(self):
         self.running = True
@@ -150,6 +164,7 @@ class EndpointHarvester:
         self.error = None
         self.metrics = MetricsLogger()
         self.date_format = self.detect_date_format()
+        self.logger = get_thread_logger()
 
     def harvest(self, s3_bucket, state_manager: StateManager, first=None, last=None):
         """
@@ -161,7 +176,7 @@ class EndpointHarvester:
         if isinstance(last, datetime):
             last = last.date()
 
-        LOGGER.info(f"Harvesting from {first} 00:00:00 timezone.utc to {last} 23:59:59 timezone.utc")
+        self.logger.info(f"Harvesting from {first} 00:00:00 timezone.utc to {last} 23:59:59 timezone.utc")
 
         self.state.last_harvest_started = datetime.now(timezone.utc)
         self.state.error = None
@@ -204,7 +219,7 @@ class EndpointHarvester:
         if self.state.pmh_set:
             args["set"] = self.state.pmh_set
 
-        LOGGER.info(f"OAI-PMH request parameters: {args}")
+        self.logger.info(f"OAI-PMH request parameters: {args}")
 
         try:
             my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics)
@@ -217,7 +232,7 @@ class EndpointHarvester:
                     complete_list_size = resumption_token_element.attrib.get('completeListSize')
                     if complete_list_size:
                         self.metrics.total_records = int(complete_list_size)
-                        LOGGER.info(f"Total records to harvest: {self.metrics.total_records}")
+                        self.logger.info(f"Total records to harvest: {self.metrics.total_records}")
 
             current_batch = []
             batch_number = 1
@@ -244,7 +259,7 @@ class EndpointHarvester:
                 self.save_batch(s3_client, s3_bucket, batch_number, current_batch, first_record_in_batch)
 
         except NoRecordsMatch:
-            LOGGER.info(f"No records found for {self.state.pmh_url} with args {args}")
+            self.logger.info(f"No records found for {self.state.pmh_url} with args {args}")
 
         except Exception as e:
             self.state.error = f"Error harvesting records: {str(e)}"
@@ -295,7 +310,7 @@ class EndpointHarvester:
                 Metadata=metadata
             )
 
-            LOGGER.info(f"Uploaded batch {batch_number} to {object_key}")
+            self.logger.info(f"Uploaded batch {batch_number} to {object_key}")
 
             # save checkpoint after every batch, using date - 1 day
             checkpoint_date = most_recent_date - timedelta(days=1)
@@ -303,7 +318,7 @@ class EndpointHarvester:
                 self.state.most_recent_date_harvested = checkpoint_date
                 db.merge(self.state)
                 db.commit()
-                LOGGER.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
+                self.logger.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
 
         except Exception as e:
             LOGGER.exception(f"Error saving batch {batch_number}")
@@ -328,10 +343,10 @@ class EndpointHarvester:
             earliest = identify.earliestDatestamp
 
             if 'T' in earliest:
-                LOGGER.info("Repository supports full timestamp format 'YYYY-MM-DDTHH:MM:SSZ'")
+                self.logger.info("Repository supports full timestamp format 'YYYY-MM-DDTHH:MM:SSZ'")
                 return '%Y-%m-%dT%H:%M:%SZ'
             else:
-                LOGGER.info("Repository supports date-only format 'YYYY-MM-DD'")
+                self.logger.info("Repository supports date-only format 'YYYY-MM-DD'")
                 return '%Y-%m-%d'
         except Exception as e:
             LOGGER.warning(f"Unable to determine date format; defaulting to 'YYYY-MM-DD': {e}")
@@ -457,6 +472,7 @@ class MySickle(Sickle):
         kwargs['max_retries'] = kwargs.get('max_retries', 3)
         if 'osti.gov/oai' in args[0]:
             kwargs['timeout'] = (30, 300)
+        self.logger = get_thread_logger()
         super(MySickle, self).__init__(*args, **kwargs)
 
     def set_metrics_logger(self, metrics_logger):
@@ -479,7 +495,7 @@ class MySickle(Sickle):
                     self.metrics_logger.update_url(http_response.url)
 
                 if http_response.status_code == 422 and 'zenodo.org' in self.endpoint:
-                    LOGGER.info("Zenodo returned 422 - treating as no records available")
+                    self.logger.info("Zenodo returned 422 - treating as no records available")
                     empty_response = '<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><responseDate>2024-11-11T14:30:00Z</responseDate><request verb="ListRecords">' + self.endpoint + '</request><error code="noRecordsMatch">No matching records found</error></OAI-PMH>'
                     http_response._content = empty_response.encode('utf-8')
                     http_response.status_code = 200
@@ -489,7 +505,7 @@ class MySickle(Sickle):
                         retry_wait = int(retry_after)
                     else:
                         retry_wait = min(retry_wait * 2, 60)
-                    LOGGER.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
+                    self.logger.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
                     sleep(retry_wait)
                     continue
 
@@ -511,7 +527,7 @@ class MySickle(Sickle):
                 LOGGER.error(f"Error harvesting from {self.endpoint}: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise
-                LOGGER.info(f"Retrying after {retry_wait} seconds due to error...")
+                self.logger.info(f"Retrying after {retry_wait} seconds due to error...")
                 sleep(retry_wait)
 
         raise Exception(f"Failed to harvest after {self.max_retries} retries")
@@ -555,49 +571,97 @@ def parse_datestamp(datestamp_str):
         return datetime(2000, 1, 1)
 
 
+def harvest_endpoint(endpoint, s3_bucket, state_manager, start_date, end_date):
+    """Worker function for thread pool"""
+    logger = get_thread_logger()
+    logger.info(f"Starting harvest for endpoint: {endpoint.pmh_url}")
+
+    try:
+        harvester = EndpointHarvester(endpoint)
+        harvester.harvest(
+            s3_bucket=s3_bucket,
+            state_manager=state_manager,
+            first=start_date,
+            last=end_date
+        )
+        logger.info(f"Completed harvest for endpoint: {endpoint.pmh_url}")
+    except Exception as e:
+        logger.error(f"Error harvesting endpoint {endpoint.pmh_url}: {str(e)}")
+        raise
+
 
 def main():
     parser = argparse.ArgumentParser(description='OAI-PMH Repository Harvester')
 
     parser.add_argument('--endpoint-id', help='Specific endpoint ID to harvest')
-    parser.add_argument('--start-date', type=parse_date, help='Start date in YYYY-MM-DD format.')
-    parser.add_argument('--end-date', type=parse_date, help='End date in YYYY-MM-DD format.')
-    parser.add_argument('--core-endpoints', action='store_true', help='Harvest core metadata only')
+    parser.add_argument('--start-date', type=parse_date,
+                        help='Start date in YYYY-MM-DD format.')
+    parser.add_argument('--end-date', type=parse_date,
+                        help='End date in YYYY-MM-DD format.')
+    parser.add_argument('--core-endpoints', action='store_true',
+                        help='Harvest core metadata only')
+    parser.add_argument('--n_threads', type=int, default=1,
+                        help='Number of concurrent harvesting threads')
 
     args = parser.parse_args()
+
+    # Configure root logger
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger("harvester.main")
 
     state_manager = StateManager()
 
     if args.endpoint_id:
         endpoint = state_manager.get_endpoint(args.endpoint_id)
         if not endpoint:
-            print(f"No endpoint found with ID: {args.endpoint_id}")
+            logger.error(f"No endpoint found with ID: {args.endpoint_id}")
             return
         endpoints = [endpoint]
     elif args.core_endpoints:
         endpoints = state_manager.get_core_endpoints()
-        print(f"Found {len(endpoints)} core endpoints ready to harvest")
+        logger.info(f"Found {len(endpoints)} core endpoints ready to harvest")
     else:
         endpoints = state_manager.get_other_endpoints()
-        print(f"Found {len(endpoints)} endpoints ready to harvest")
+        logger.info(f"Found {len(endpoints)} endpoints ready to harvest")
 
-    for endpoint in endpoints:
-        print(f"\nProcessing endpoint: {endpoint.pmh_url}")
-        harvester = EndpointHarvester(endpoint)
+    with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
+        futures = []
 
-        if args.start_date:
-            first_date = args.start_date
-        else:
-            first_date = (
-                endpoint.most_recent_date_harvested.date() - timedelta(days=1)
-                if endpoint.most_recent_date_harvested
-                else harvester.get_earliest_datestamp().date()
-                     or datetime(2000, 1, 1).date()
+        for endpoint in endpoints:
+            if args.start_date:
+                first_date = args.start_date
+            else:
+                harvester = EndpointHarvester(endpoint)
+                first_date = (
+                    endpoint.most_recent_date_harvested.date() - timedelta(
+                        days=1)
+                    if endpoint.most_recent_date_harvested
+                    else harvester.get_earliest_datestamp().date()
+                         or datetime(2000, 1, 1).date()
+                )
+
+            last_date = args.end_date or (
+                        datetime.now(timezone.utc).date() - timedelta(days=1))
+
+            future = executor.submit(
+                harvest_endpoint,
+                endpoint,
+                S3_BUCKET,
+                state_manager,
+                first_date,
+                last_date
             )
+            futures.append(future)
 
-        last_date = args.end_date or (datetime.now(timezone.utc).date() - timedelta(days=1))
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Harvesting task failed: {str(e)}")
 
-        harvester.harvest(s3_bucket=S3_BUCKET, state_manager=state_manager, first=first_date, last=last_date)
 
 if __name__ == "__main__":
     main()
