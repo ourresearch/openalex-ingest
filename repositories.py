@@ -15,6 +15,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from defusedxml.ElementTree import ParseError
 import requests
 import shortuuid
+from requests import session
 from sickle import Sickle, oaiexceptions
 from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
@@ -24,8 +25,20 @@ from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_
 import tenacity
 import xml.etree.ElementTree as ET
 
-from common import Base, db, LOGGER, S3_BUCKET
+from common import Base, LOGGER, S3_BUCKET, Session
 
+
+@contextmanager
+def get_db_session():
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 class Endpoint(Base):
     __tablename__ = "endpoint"
@@ -65,27 +78,29 @@ class Endpoint(Base):
 
 class StateManager:
     def get_endpoint(self, endpoint_id: str) -> Optional[Endpoint]:
-        return db.query(Endpoint).filter_by(id=endpoint_id).first()
+        with get_db_session() as session:
+            return session.query(Endpoint).filter_by(id=endpoint_id).first()
 
     def update_endpoint_state(self, state: Endpoint):
-        db.merge(state)
-        db.commit()
+        with get_db_session() as session:
+            session.merge(state)
 
     @staticmethod
     def get_core_endpoints() -> List[Endpoint]:
-        now = datetime.now(timezone.utc)
-        ready_endpoints = db.query(Endpoint).filter(
-            Endpoint.ready_to_run == True,
-            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.is_core == True,
-            Endpoint.in_walden == True
-        ).all()
-        return ready_endpoints
+        with get_db_session() as session:
+            now = datetime.now(timezone.utc)
+            ready_endpoints = session.query(Endpoint).filter(
+                Endpoint.ready_to_run == True,
+                or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+                Endpoint.is_core == True,
+                Endpoint.in_walden == True
+            ).all()
+            return ready_endpoints
 
     @staticmethod
     def get_other_endpoints() -> List[Endpoint]:
         now = datetime.now(timezone.utc)
-        ready_endpoints = db.query(Endpoint).filter(
+        ready_endpoints = session().query(Endpoint).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
             or_(Endpoint.is_core == False, Endpoint.is_core == None),
@@ -316,8 +331,8 @@ class EndpointHarvester:
             checkpoint_date = most_recent_date - timedelta(days=1)
             if not self.state.most_recent_date_harvested or checkpoint_date > self.state.most_recent_date_harvested:
                 self.state.most_recent_date_harvested = checkpoint_date
-                db.merge(self.state)
-                db.commit()
+                with get_db_session() as session:
+                    session.merge(self.state)
                 self.logger.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
 
         except Exception as e:
