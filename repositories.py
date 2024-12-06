@@ -15,30 +15,19 @@ from botocore.exceptions import BotoCoreError, ClientError
 from defusedxml.ElementTree import ParseError
 import requests
 import shortuuid
-from requests import session
 from sickle import Sickle, oaiexceptions
 from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
 from sickle.oaiexceptions import NoRecordsMatch
 from sickle.response import OAIResponse
-from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_
+from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_, select
 import tenacity
 import xml.etree.ElementTree as ET
 
-from common import Base, LOGGER, S3_BUCKET, Session
+from sqlalchemy.orm import selectinload
 
+from common import Base, LOGGER, S3_BUCKET, Session, db
 
-@contextmanager
-def get_db_session():
-    session = Session()
-    try:
-        yield session
-        session.commit()
-    except:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 class Endpoint(Base):
     __tablename__ = "endpoint"
@@ -77,36 +66,36 @@ class Endpoint(Base):
 
 
 class StateManager:
-    def get_endpoint(self, endpoint_id: str) -> Optional[Endpoint]:
-        with get_db_session() as session:
-            return session.query(Endpoint).filter_by(id=endpoint_id).first()
-
-    def update_endpoint_state(self, state: Endpoint):
-        with get_db_session() as session:
-            session.merge(state)
+    @staticmethod
+    def get_endpoint(endpoint_id: str, session) -> Optional[Endpoint]:
+        stmt = select(Endpoint).options(selectinload('*')).filter_by(id=endpoint_id)
+        return session.execute(stmt).scalar_one_or_none()
 
     @staticmethod
-    def get_core_endpoints() -> List[Endpoint]:
-        with get_db_session() as session:
-            now = datetime.now(timezone.utc)
-            ready_endpoints = session.query(Endpoint).filter(
-                Endpoint.ready_to_run == True,
-                or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-                Endpoint.is_core == True,
-                Endpoint.in_walden == True
-            ).all()
-            return ready_endpoints
+    def update_endpoint_state(state: Endpoint, session):
+        session.merge(state)
 
     @staticmethod
-    def get_other_endpoints() -> List[Endpoint]:
+    def get_core_endpoints(session) -> List[Endpoint]:
         now = datetime.now(timezone.utc)
-        ready_endpoints = session().query(Endpoint).filter(
+        stmt = select(Endpoint).options(selectinload('*')).filter(
+            Endpoint.ready_to_run == True,
+            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+            Endpoint.is_core == True,
+            Endpoint.in_walden == True
+        )
+        return list(session.execute(stmt).scalars().all())
+
+    @staticmethod
+    def get_other_endpoints(session) -> List[Endpoint]:
+        now = datetime.now(timezone.utc)
+        stmt = select(Endpoint).options(selectinload('*')).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
             or_(Endpoint.is_core == False, Endpoint.is_core == None),
             Endpoint.in_walden == True
-        ).all()
-        return ready_endpoints
+        )
+        return list(session.execute(stmt).scalars().all())
 
 
 thread_local = threading.local()
@@ -173,15 +162,16 @@ class MetricsLogger:
 
 
 class EndpointHarvester:
-    def __init__(self, endpoint: Endpoint, batch_size=1000):
+    def __init__(self, endpoint: Endpoint, db_session, batch_size=1000):
         self.state = endpoint
         self.batch_size = batch_size
+        self.db = db_session
         self.error = None
         self.metrics = MetricsLogger()
-        self.date_format = self.detect_date_format()
         self.logger = get_thread_logger()
+        self.date_format = self.detect_date_format()
 
-    def harvest(self, s3_bucket, state_manager: StateManager, first=None, last=None):
+    def harvest(self, s3_bucket, first=None, last=None):
         """
         Harvest records from the endpoint, ensuring complete daily ingestion.
         """
@@ -195,7 +185,7 @@ class EndpointHarvester:
 
         self.state.last_harvest_started = datetime.now(timezone.utc)
         self.state.error = None
-        state_manager.update_endpoint_state(self.state)
+        StateManager.update_endpoint_state(self.state, self.db)
 
         try:
             self.metrics.start()
@@ -219,7 +209,7 @@ class EndpointHarvester:
             self.state.retry_interval = retry_interval * 2
         finally:
             self.metrics.stop()
-            state_manager.update_endpoint_state(self.state)
+            StateManager.update_endpoint_state(self.state, self.db)
 
     def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
         from_date = first.strftime(self.date_format)
@@ -331,8 +321,8 @@ class EndpointHarvester:
             checkpoint_date = most_recent_date - timedelta(days=1)
             if not self.state.most_recent_date_harvested or checkpoint_date > self.state.most_recent_date_harvested:
                 self.state.most_recent_date_harvested = checkpoint_date
-                with get_db_session() as session:
-                    session.merge(self.state)
+                self.db.merge(self.state)
+                self.db.commit()
                 self.logger.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
 
         except Exception as e:
@@ -586,16 +576,16 @@ def parse_datestamp(datestamp_str):
         return datetime(2000, 1, 1)
 
 
-def harvest_endpoint(endpoint, s3_bucket, state_manager, start_date, end_date):
+def harvest_endpoint(endpoint, s3_bucket, start_date, end_date):
     """Worker function for thread pool"""
     logger = get_thread_logger()
     logger.info(f"Starting harvest for endpoint: {endpoint.pmh_url}")
 
     try:
-        harvester = EndpointHarvester(endpoint)
+        s = Session()
+        harvester = EndpointHarvester(endpoint, s)
         harvester.harvest(
             s3_bucket=s3_bucket,
-            state_manager=state_manager,
             first=start_date,
             last=end_date
         )
@@ -627,19 +617,17 @@ def main():
     )
     logger = logging.getLogger("harvester.main")
 
-    state_manager = StateManager()
-
     if args.endpoint_id:
-        endpoint = state_manager.get_endpoint(args.endpoint_id)
+        endpoint = StateManager.get_endpoint(args.endpoint_id, db)
         if not endpoint:
             logger.error(f"No endpoint found with ID: {args.endpoint_id}")
             return
         endpoints = [endpoint]
     elif args.core_endpoints:
-        endpoints = state_manager.get_core_endpoints()
+        endpoints = StateManager.get_core_endpoints(db)
         logger.info(f"Found {len(endpoints)} core endpoints ready to harvest")
     else:
-        endpoints = state_manager.get_other_endpoints()
+        endpoints = StateManager.get_other_endpoints(db)
         logger.info(f"Found {len(endpoints)} endpoints ready to harvest")
 
     with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
@@ -649,7 +637,7 @@ def main():
             if args.start_date:
                 first_date = args.start_date
             else:
-                harvester = EndpointHarvester(endpoint)
+                harvester = EndpointHarvester(endpoint, db)
                 first_date = (
                     endpoint.most_recent_date_harvested.date() - timedelta(
                         days=1)
@@ -665,7 +653,6 @@ def main():
                 harvest_endpoint,
                 endpoint,
                 S3_BUCKET,
-                state_manager,
                 first_date,
                 last_date
             )
