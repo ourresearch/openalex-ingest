@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import time
+import urllib.parse
 
 import boto3
 import requests
@@ -10,12 +11,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from common import S3_BUCKET, LOGGER
 
 CROSSREF_API_KEY = os.getenv('CROSSREF_API_KEY')
-
-
-"""
-Run with python crossref_journals.py.
-Gets all journals from the Crossref API and saves them to S3, every time.
-"""
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -43,21 +38,17 @@ def get_journals_data(s3_bucket, s3_prefix):
         "User-Agent": "mailto:dev@ourresearch.org",
         "crossref-api-key": CROSSREF_API_KEY
     }
-    per_page = 1000
-    offset = 0
+    rows = 1000
+    cursor = '*'
     page_number = 1
     has_more_pages = True
 
-    url_template = f"{base_url}?rows={{rows}}&offset={{offset}}"
-
     while has_more_pages:
-        url = url_template.format(
-            rows=per_page,
-            offset=offset
-        )
+        encoded_cursor = urllib.parse.quote(cursor)
+        url = f"{base_url}?rows={rows}&cursor={encoded_cursor}"
 
         response = make_request_with_retry(url, headers)
-        LOGGER.info(f"Requesting page {page_number} from URL {url}.")
+        LOGGER.info(f"Requesting page {page_number} using cursor: {cursor}")
 
         data = response.json()
         items = data['message']['items']
@@ -67,18 +58,18 @@ def get_journals_data(s3_bucket, s3_prefix):
             current_timestamp = datetime.datetime.now().isoformat()
             s3_key = f'{s3_prefix}/journals_page_{page_number}_{current_timestamp}.json'
             save_to_s3(items, s3_bucket, s3_key)
-            LOGGER.info(f"Progress: {offset + len(items)}/{total_results} journals processed")
+            LOGGER.info(f"Saved page {page_number} with {len(items)} journals")
         else:
             LOGGER.info(f"No more items to fetch on page {page_number}. Ending pagination.")
             has_more_pages = False
 
-        offset += per_page
-        if offset >= total_results:
-            LOGGER.info("Reached end of results, pagination complete.")
+        if 'next-cursor' not in data['message']:
+            LOGGER.info("No next cursor found. Pagination complete.")
             has_more_pages = False
-
-        page_number += 1
-        time.sleep(.5)  # Basic rate limiting
+        else:
+            cursor = data['message']['next-cursor']
+            page_number += 1
+            time.sleep(.5)  # Basic rate limiting
 
 
 def save_to_s3(json_data, s3_bucket, s3_key):
