@@ -66,18 +66,13 @@ def upload_worker(q):
         q.task_done()
 
 
-def should_retry_exception(exception):
-    retry_exceptions = (
+@retry(
+    retry=retry_if_exception_type((
         requests.exceptions.RequestException,
         requests.exceptions.HTTPError,
         requests.exceptions.ConnectionError,
-        requests.exceptions.Timeout
-    )
-    return isinstance(exception, retry_exceptions)
-
-
-@retry(
-    retry=retry_if_exception_type(should_retry_exception),
+        requests.exceptions.Timeout,
+    )),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     stop=stop_after_attempt(3),
     before_sleep=lambda retry_state: LOGGER.info(
@@ -140,6 +135,8 @@ def harvest_records(record_type, num_threads, update_mode=False):
         t = threading.Thread(target=upload_worker, args=(upload_queue,))
         t.start()
         workers.append(t)
+
+    count = 0
 
     try:
         count = fetch_and_process_records(sickle, kwargs, record_type, upload_queue)
