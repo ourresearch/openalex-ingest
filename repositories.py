@@ -20,7 +20,7 @@ from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
 from sickle.oaiexceptions import NoRecordsMatch
 from sickle.response import OAIResponse
-from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_, select, func
+from sqlalchemy import Column, Text, DateTime, Boolean, Interval, and_, or_, select, func
 import tenacity
 import xml.etree.ElementTree as ET
 
@@ -90,12 +90,26 @@ class StateManager:
     @staticmethod
     def get_other_endpoints(session) -> List[Endpoint]:
         now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(hours=1)  # Consider 1 hour as "recent"
+
         stmt = select(Endpoint).options(selectinload('*')).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
             Endpoint.retry_interval < timedelta(days=30),
             or_(Endpoint.is_core == False, Endpoint.is_core == None),
-            Endpoint.in_walden == True
+            Endpoint.in_walden == True,
+            # Skip endpoints that recently started but didn't finish
+            or_(
+                Endpoint.last_harvest_started == None,
+                and_(
+                    Endpoint.last_harvest_started < recent_cutoff,
+                    or_(
+                        Endpoint.last_harvest_finished != None,
+                        Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
+                        # Assume stalled after 4 hours
+                    )
+                )
+            )
         ).order_by(func.random())
 
         return list(session.execute(stmt).scalars().all())
