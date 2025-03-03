@@ -74,6 +74,7 @@ class StateManager:
     @staticmethod
     def update_endpoint_state(state: Endpoint, session):
         session.merge(state)
+        session.commit()
 
     @staticmethod
     def get_core_endpoints(session) -> List[Endpoint]:
