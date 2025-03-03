@@ -20,7 +20,7 @@ from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
 from sickle.oaiexceptions import NoRecordsMatch
 from sickle.response import OAIResponse
-from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_, select
+from sqlalchemy import Column, Text, DateTime, Boolean, Interval, or_, select, func
 import tenacity
 import xml.etree.ElementTree as ET
 
@@ -92,9 +92,11 @@ class StateManager:
         stmt = select(Endpoint).options(selectinload('*')).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+            Endpoint.retry_interval < timedelta(days=30),
             or_(Endpoint.is_core == False, Endpoint.is_core == None),
             Endpoint.in_walden == True
-        )
+        ).order_by(func.random())
+
         return list(session.execute(stmt).scalars().all())
 
 
