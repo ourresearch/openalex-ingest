@@ -88,17 +88,28 @@ class StateManager:
         return list(session.execute(stmt).scalars().all())
 
     @staticmethod
-    def get_other_endpoints(session) -> List[Endpoint]:
+    def get_reliable_non_core_endpoints(session) -> List[Endpoint]:
+        """
+        Get non-core endpoints that have been working properly recently.
+        Criteria:
+        - Not core endpoints but ready to run
+        - Have successfully completed a harvest within the last 120 days
+        - Have a reasonable retry interval (not too long)
+        """
         now = datetime.now(timezone.utc)
+        last_harvested_cutoff = now - timedelta(days=180)
         recent_cutoff = now - timedelta(hours=1)  # Consider 1 hour as "recent"
 
         stmt = select(Endpoint).options(selectinload('*')).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.retry_interval < timedelta(days=30),
-            or_(Endpoint.is_core == False, Endpoint.is_core == None),
+            Endpoint.is_core == False,
             Endpoint.in_walden == True,
-            # Skip endpoints that recently started but didn't finish
+            Endpoint.last_harvest_finished != None,
+            Endpoint.last_harvest_finished > last_harvested_cutoff,
+            Endpoint.most_recent_date_harvested != None,
+            Endpoint.most_recent_date_harvested > last_harvested_cutoff,
+            Endpoint.retry_interval < timedelta(days=7),
             or_(
                 Endpoint.last_harvest_started == None,
                 and_(
@@ -107,6 +118,38 @@ class StateManager:
                         Endpoint.last_harvest_finished != None,
                         Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
                         # Assume stalled after 4 hours
+                    )
+                )
+            )
+        ).order_by(Endpoint.last_harvest_finished.desc())
+
+        return list(session.execute(stmt).scalars().all())
+
+    @staticmethod
+    def get_other_endpoints(session) -> List[Endpoint]:
+        """
+        Get remaining non-core endpoints that are not in the reliable category.
+        These are endpoints that we still want to try but might be problematic.
+        """
+        now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(hours=1)  # Consider 1 hour as "recent"
+
+        reliable_ids = [ep.id for ep in StateManager.get_reliable_non_core_endpoints(session)]
+
+        stmt = select(Endpoint).options(selectinload('*')).filter(
+            Endpoint.ready_to_run == True,
+            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+            Endpoint.retry_interval < timedelta(days=30),
+            Endpoint.is_core == False,
+            Endpoint.in_walden == True,
+            Endpoint.id.notin_(reliable_ids) if reliable_ids else True,
+            or_(
+                Endpoint.last_harvest_started == None,
+                and_(
+                    Endpoint.last_harvest_started < recent_cutoff,
+                    or_(
+                        Endpoint.last_harvest_finished != None,
+                        Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
                     )
                 )
             )
@@ -621,7 +664,11 @@ def main():
     parser.add_argument('--end-date', type=parse_date,
                         help='End date in YYYY-MM-DD format.')
     parser.add_argument('--core-endpoints', action='store_true',
-                        help='Harvest core metadata only')
+                        help='Harvest core endpoints only')
+    parser.add_argument('--reliable-endpoints', action='store_true',
+                        help='Harvest reliable non-core endpoints only')
+    parser.add_argument('--other-endpoints', action='store_true',
+                        help='Harvest other less reliable endpoints only')
     parser.add_argument('--n_threads', type=int, default=1,
                         help='Number of concurrent harvesting threads')
 
@@ -643,9 +690,23 @@ def main():
     elif args.core_endpoints:
         endpoints = StateManager.get_core_endpoints(db)
         logger.info(f"Found {len(endpoints)} core endpoints ready to harvest")
-    else:
+    elif args.reliable_endpoints:
+        endpoints = StateManager.get_reliable_non_core_endpoints(db)
+        logger.info(f"Found {len(endpoints)} reliable non-core endpoints ready to harvest")
+    elif args.other_endpoints:
         endpoints = StateManager.get_other_endpoints(db)
-        logger.info(f"Found {len(endpoints)} endpoints ready to harvest")
+        logger.info(f"Found {len(endpoints)} other endpoints ready to harvest")
+    else:
+        # By default, harvest all endpoint types
+        core_endpoints = StateManager.get_core_endpoints(db)
+        reliable_endpoints = StateManager.get_reliable_non_core_endpoints(db)
+        other_endpoints = StateManager.get_other_endpoints(db)
+
+        endpoints = core_endpoints + reliable_endpoints + other_endpoints
+
+        logger.info(f"Found {len(core_endpoints)} core endpoints, " +
+                    f"{len(reliable_endpoints)} reliable non-core endpoints, and " +
+                    f"{len(other_endpoints)} other endpoints ready to harvest")
 
     with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
         futures = []
