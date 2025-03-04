@@ -103,7 +103,7 @@ class StateManager:
         stmt = select(Endpoint).options(selectinload('*')).filter(
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.is_core == False,
+            or_(Endpoint.is_core == False, Endpoint.is_core == None),
             Endpoint.in_walden == True,
             Endpoint.last_harvest_finished != None,
             Endpoint.last_harvest_finished > last_harvested_cutoff,
