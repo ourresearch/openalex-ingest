@@ -62,7 +62,7 @@ def main():
 
     for ftp_path, subdir, fname in tarballs:
         archive_name = fname.replace('.tar.gz', '')
-        s3_prefix = f"pubmed_central/{subdir}/{archive_name}"
+        s3_prefix = f"pubmed-central/{subdir}/{archive_name}"
 
         if already_processed(s3_prefix):
             print(f"Skipping {ftp_path} — already processed.")
