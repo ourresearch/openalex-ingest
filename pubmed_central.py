@@ -1,7 +1,9 @@
 import os
+import tarfile
 import tempfile
 from ftplib import FTP
 import boto3
+from pathlib import Path
 
 S3_BUCKET = "openalex-ingest"
 PMC_SUBDIRS = [
@@ -38,12 +40,20 @@ def download_tarball(ftp_path, local_path):
         ftp.retrbinary(f"RETR {ftp_path}", f.write)
     ftp.quit()
 
-def upload_tarball_to_s3(local_tarball, s3_key):
-    s3_client.upload_file(local_tarball, S3_BUCKET, s3_key)
-    print(f"Uploaded archive to s3://{S3_BUCKET}/{s3_key}")
+def extract_and_upload(local_tarball, s3_prefix):
+    with tarfile.open(local_tarball, "r:gz") as tar:
+        for member in tar.getmembers():
+            if member.isfile() and member.name.endswith(('.nxml', '.xml')):
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
 
-def already_uploaded(s3_key):
-    response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_key, MaxKeys=1)
+                s3_key = f"{s3_prefix}/{member.name}"
+                s3_client.upload_fileobj(extracted, S3_BUCKET, s3_key)
+                print(f"Uploaded to s3://{S3_BUCKET}/{s3_key}")
+
+def already_processed(s3_prefix):
+    response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_prefix, MaxKeys=1)
     return "Contents" in response
 
 def main():
@@ -51,10 +61,11 @@ def main():
     print(f"Found {len(tarballs)} tarballs to process.")
 
     for ftp_path, subdir, fname in tarballs:
-        s3_key = f"pubmed_central/{subdir}/{fname}"
+        archive_name = fname.replace('.tar.gz', '')
+        s3_prefix = f"pubmed_central/{subdir}/{archive_name}"
 
-        if already_uploaded(s3_key):
-            print(f"Skipping {ftp_path} — already uploaded.")
+        if already_processed(s3_prefix):
+            print(f"Skipping {ftp_path} — already processed.")
             continue
 
         print(f"Processing: {ftp_path}")
@@ -63,7 +74,7 @@ def main():
 
         try:
             download_tarball(ftp_path, tmp_path)
-            upload_tarball_to_s3(tmp_path, s3_key)
+            extract_and_upload(tmp_path, s3_prefix)
         finally:
             os.remove(tmp_path)
 
