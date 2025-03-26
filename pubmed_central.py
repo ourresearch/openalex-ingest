@@ -9,7 +9,8 @@ S3_BUCKET = "openalex-ingest"
 PMC_SUBDIRS = [
     "oa_bulk/oa_comm/xml",
     "oa_bulk/oa_noncomm/xml",
-    "oa_bulk/oa_other/xml"
+    "oa_bulk/oa_other/xml",
+    "manuscript/xml"
 ]
 
 s3_client = boto3.client("s3")
