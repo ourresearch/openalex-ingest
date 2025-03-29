@@ -163,11 +163,15 @@ thread_local = threading.local()
 def get_thread_logger():
     if not hasattr(thread_local, "logger"):
         thread_local.logger = logging.getLogger(f"harvester.{threading.current_thread().name}")
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        thread_local.logger.addHandler(handler)
-        thread_local.logger.setLevel(logging.INFO)
+        # Only add handler if no handlers exist
+        if not thread_local.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            thread_local.logger.addHandler(handler)
+            thread_local.logger.setLevel(logging.INFO)
+            # Prevent propagation to avoid double logging
+            thread_local.logger.propagate = False
     return thread_local.logger
 
 class MetricsLogger:
