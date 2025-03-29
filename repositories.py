@@ -233,43 +233,30 @@ class EndpointHarvester:
 
     def harvest(self, s3_bucket, first=None, last=None):
         """
-        Harvest records from the endpoint, ensuring complete daily ingestion.
+        Harvest records from the endpoint over the given date range.
+        Assumes that first and last are already bounded (e.g., 1–5 days),
+        and does NOT update any state.
         """
-        first = first or datetime(2000, 1, 1).date()  # default to 2000-01-01 if no `first` date provided
+        first = first or datetime(2000, 1, 1).date()
         if isinstance(first, datetime):
             first = first.date()
         if isinstance(last, datetime):
             last = last.date()
 
-        self.logger.info(f"Harvesting from {first} 00:00:00 timezone.utc to {last} 23:59:59 timezone.utc")
-
-        self.state.last_harvest_started = datetime.now(timezone.utc)
-        self.state.error = None
-        StateManager.update_endpoint_state(self.state, self.db)
+        self.logger.info(f"Harvesting from {first} to {last} (UTC range)")
 
         try:
             self.metrics.start()
             with self._get_s3_client() as s3_client:
-                current_date = first
-                while current_date <= last:
-                    next_date = current_date + timedelta(days=1)
-                    self.call_pmh_endpoint(s3_client, s3_bucket, current_date, next_date - timedelta(seconds=1))
-                    current_date = next_date
-
-            self.state.last_harvest_finished = datetime.now(timezone.utc)
-            self.state.most_recent_date_harvested = last
-            self.state.error = None
-            self.state.retry_at = None
-            self.state.retry_interval = timedelta(minutes=5)
-        except Exception as e:
-            self.state.error = str(e)
-            base_retry_interval = timedelta(minutes=5)
-            retry_interval = self.state.retry_interval or base_retry_interval
-            self.state.retry_at = datetime.now(timezone.utc) + retry_interval
-            self.state.retry_interval = retry_interval * 2
+                # One call for the entire range
+                self.call_pmh_endpoint(
+                    s3_client=s3_client,
+                    s3_bucket=s3_bucket,
+                    first=first,
+                    last=last
+                )
         finally:
             self.metrics.stop()
-            StateManager.update_endpoint_state(self.state, self.db)
 
     def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
         from_date = first.strftime(self.date_format)
@@ -573,6 +560,19 @@ class MySickle(Sickle):
                     self.logger.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
                     sleep(retry_wait)
                     continue
+                elif http_response.status_code == 429:
+                    retry_after = http_response.headers.get('Retry-After')
+                    if retry_after:
+                        try:
+                            retry_wait = int(retry_after)
+                        except ValueError:
+                            retry_wait = self.DEFAULT_RETRY_SECONDS
+                    else:
+                        retry_wait = min(retry_wait * 2, 60)
+
+                    self.logger.warning(f"HTTP 429 Too Many Requests. Retrying after {retry_wait} seconds...")
+                    sleep(retry_wait)
+                    continue
 
                 http_response.raise_for_status()
 
@@ -636,19 +636,39 @@ def parse_datestamp(datestamp_str):
         return datetime(2000, 1, 1)
 
 
-def harvest_endpoint(endpoint, s3_bucket, start_date, end_date):
-    """Worker function for thread pool"""
+def harvest_endpoint(endpoint, s3_bucket, start_date, end_date, parallel_dates=1):
     logger = get_thread_logger()
     logger.info(f"Starting harvest for endpoint: {endpoint.pmh_url}")
-
     try:
         s = Session()
         harvester = EndpointHarvester(endpoint, s)
-        harvester.harvest(
-            s3_bucket=s3_bucket,
-            first=start_date,
-            last=end_date
-        )
+
+        if parallel_dates == 1:
+            harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
+        else:
+            date_ranges = []
+            current = start_date
+            while current <= end_date:
+                range_end = min(current + timedelta(days=parallel_dates - 1), end_date)
+                date_ranges.append((current, range_end))
+                current = range_end + timedelta(days=1)
+
+            with ThreadPoolExecutor(max_workers=parallel_dates) as date_executor:
+                futures = [
+                    date_executor.submit(harvester.harvest, s3_bucket, first, last)
+                    for first, last in date_ranges
+                ]
+                for future in as_completed(futures):
+                    future.result()
+
+            # After all subtasks finish, update the final state
+            endpoint.last_harvest_finished = datetime.now(timezone.utc)
+            endpoint.most_recent_date_harvested = end_date
+            endpoint.error = None
+            endpoint.retry_at = None
+            endpoint.retry_interval = timedelta(minutes=5)
+            StateManager.update_endpoint_state(endpoint, s)
+
         logger.info(f"Completed harvest for endpoint: {endpoint.pmh_url}")
     except Exception as e:
         logger.error(f"Error harvesting endpoint {endpoint.pmh_url}: {str(e)}")
@@ -671,6 +691,8 @@ def main():
                         help='Harvest other less reliable endpoints only')
     parser.add_argument('--n_threads', type=int, default=1,
                         help='Number of concurrent harvesting threads')
+    parser.add_argument('--parallel-dates', type=int, default=1,
+                        help='Number of days to harvest in parallel for each endpoint')
 
     args = parser.parse_args()
 
@@ -732,7 +754,8 @@ def main():
                 endpoint,
                 S3_BUCKET,
                 first_date,
-                last_date
+                last_date,
+                args.parallel_dates
             )
             futures.append(future)
 
