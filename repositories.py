@@ -646,18 +646,21 @@ def harvest_endpoint(endpoint, s3_bucket, start_date, end_date, parallel_dates=1
         if parallel_dates == 1:
             harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
         else:
+            # Create single-day ranges instead of multi-day chunks
             date_ranges = []
             current = start_date
             while current <= end_date:
-                range_end = min(current + timedelta(days=parallel_dates - 1), end_date)
-                date_ranges.append((current, range_end))
-                current = range_end + timedelta(days=1)
+                # Each range is exactly one day (same start and end date)
+                date_ranges.append((current, current))
+                current = current + timedelta(days=1)
 
+            # Process up to parallel_dates number of single days concurrently
             with ThreadPoolExecutor(max_workers=parallel_dates) as date_executor:
                 futures = []
                 for first, last in date_ranges:
-                    logger.info(f"Submitting date range: {first} to {last}")
+                    logger.info(f"Submitting single day: {first}")
                     futures.append(date_executor.submit(harvester.harvest, s3_bucket, first, last))
+
                 for future in as_completed(futures):
                     future.result()
 
