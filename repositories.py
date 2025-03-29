@@ -654,10 +654,10 @@ def harvest_endpoint(endpoint, s3_bucket, start_date, end_date, parallel_dates=1
                 current = range_end + timedelta(days=1)
 
             with ThreadPoolExecutor(max_workers=parallel_dates) as date_executor:
-                futures = [
-                    date_executor.submit(harvester.harvest, s3_bucket, first, last)
-                    for first, last in date_ranges
-                ]
+                futures = []
+                for first, last in date_ranges:
+                    logger.info(f"Submitting date range: {first} to {last}")
+                    futures.append(date_executor.submit(harvester.harvest, s3_bucket, first, last))
                 for future in as_completed(futures):
                     future.result()
 
