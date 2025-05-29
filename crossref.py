@@ -98,7 +98,8 @@ def save_to_s3(json_data, s3_bucket, s3_key):
 
 def main():
     parser = argparse.ArgumentParser(description='Pull Crossref data (new works or updates).')
-    parser.add_argument('mode', choices=['new', 'updates_two_days_ago', 'updates'], help='Specify whether to pull new works or updates.')
+    parser.add_argument('mode', choices=['new', 'updates_two_days_ago', 'updates', 'october_2024'],
+                        help='Specify whether to pull new works, updates, or October 2024 data.')
     args = parser.parse_args()
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -116,6 +117,12 @@ def main():
     elif args.mode == 'updates':
         filter_params = f'from-index-date:{two_days_ago_str},until-index-date:{yesterday_str}'
         s3_prefix = f'crossref/updates/{yesterday.strftime("%Y/%m/%d")}'
+        get_crossref_data(filter_params, S3_BUCKET, s3_prefix)
+
+    elif args.mode == 'october_2024':
+        filter_params = 'from-created-date:2024-10-01,until-created-date:2024-10-07'
+        s3_prefix = 'crossref/new-works/2024/10'
+        LOGGER.info(f"Running October 2024 batch job with filter: {filter_params}")
         get_crossref_data(filter_params, S3_BUCKET, s3_prefix)
 
 
