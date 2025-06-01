@@ -120,7 +120,7 @@ def main():
         get_crossref_data(filter_params, S3_BUCKET, s3_prefix)
 
     elif args.mode == 'october_2024':
-        filter_params = 'from-created-date:2024-10-15,until-created-date:2024-10-22'
+        filter_params = 'from-created-date:2024-10-23,until-created-date:2024-10-30'
         s3_prefix = 'crossref/new-works/2024/10'
         LOGGER.info(f"Running October 2024 batch job with filter: {filter_params}")
         get_crossref_data(filter_params, S3_BUCKET, s3_prefix)
