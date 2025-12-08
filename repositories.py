@@ -93,11 +93,11 @@ class StateManager:
         Get non-core endpoints that have been working properly recently.
         Criteria:
         - Not core endpoints but ready to run
-        - Have successfully completed a harvest within the last 120 days
+        - Have successfully completed a harvest within the last 365 days
         - Have a reasonable retry interval (not too long)
         """
         now = datetime.now(timezone.utc)
-        last_harvested_cutoff = now - timedelta(days=180)
+        last_harvested_cutoff = now - timedelta(days=365)
         recent_cutoff = now - timedelta(hours=1)  # Consider 1 hour as "recent"
 
         stmt = select(Endpoint).options(selectinload('*')).filter(
@@ -140,7 +140,7 @@ class StateManager:
             Endpoint.ready_to_run == True,
             or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
             Endpoint.retry_interval < timedelta(days=30),
-            Endpoint.is_core == False,
+            or_(Endpoint.is_core == False, Endpoint.is_core == None),
             Endpoint.in_walden == True,
             Endpoint.id.notin_(reliable_ids) if reliable_ids else True,
             or_(
