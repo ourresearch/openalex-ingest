@@ -583,7 +583,8 @@ class MySickle(Sickle):
                 # validate response content
                 if not http_response.text.strip():
                     raise Exception("Empty response received from server")
-                if not http_response.text.strip().startswith('<?xml'):
+                response_start = http_response.text.strip()[:100].lower()
+                if not (response_start.startswith('<?xml') or response_start.startswith('<oai-pmh')):
                     raise Exception(f"Invalid XML response: {http_response.text[:100]}")
 
                 if self.encoding:
