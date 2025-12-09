@@ -157,6 +157,36 @@ class StateManager:
 
         return list(session.execute(stmt).scalars().all())
 
+    @staticmethod
+    def get_abandoned_endpoints(session) -> List[Endpoint]:
+        """
+        Get endpoints that have been abandoned due to too many failures.
+        These have retry_interval >= 30 days and are not picked up by other queries.
+        Run monthly to give them another chance.
+        """
+        now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(hours=1)
+
+        stmt = select(Endpoint).options(selectinload('*')).filter(
+            Endpoint.ready_to_run == True,
+            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
+            Endpoint.retry_interval >= timedelta(days=30),
+            or_(Endpoint.is_core == False, Endpoint.is_core == None),
+            Endpoint.in_walden == True,
+            or_(
+                Endpoint.last_harvest_started == None,
+                and_(
+                    Endpoint.last_harvest_started < recent_cutoff,
+                    or_(
+                        Endpoint.last_harvest_finished != None,
+                        Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
+                    )
+                )
+            )
+        ).order_by(func.random())
+
+        return list(session.execute(stmt).scalars().all())
+
 
 thread_local = threading.local()
 
@@ -319,7 +349,6 @@ class EndpointHarvester:
 
         except Exception as e:
             self.state.error = f"Error harvesting records: {str(e)}"
-            LOGGER.exception(f"Error harvesting from {self.state.pmh_url}")
             raise
 
     @tenacity.retry(
@@ -697,6 +726,8 @@ def main():
                         help='Harvest reliable non-core endpoints only')
     parser.add_argument('--other-endpoints', action='store_true',
                         help='Harvest other less reliable endpoints only')
+    parser.add_argument('--abandoned-endpoints', action='store_true',
+                        help='Harvest abandoned endpoints (retry_interval >= 30 days). Run monthly.')
     parser.add_argument('--n_threads', type=int, default=1,
                         help='Number of concurrent harvesting threads')
     parser.add_argument('--parallel-dates', type=int, default=1,
@@ -726,6 +757,9 @@ def main():
     elif args.other_endpoints:
         endpoints = StateManager.get_other_endpoints(db)
         logger.info(f"Found {len(endpoints)} other endpoints ready to harvest")
+    elif args.abandoned_endpoints:
+        endpoints = StateManager.get_abandoned_endpoints(db)
+        logger.info(f"Found {len(endpoints)} abandoned endpoints to retry")
     else:
         # By default, harvest all endpoint types
         core_endpoints = StateManager.get_core_endpoints(db)

@@ -14,6 +14,7 @@ def _make_logger():
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    logger.propagate = False
     return logger
 
 LOGGER = _make_logger()
