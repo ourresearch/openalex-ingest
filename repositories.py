@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import gzip
+import hashlib
 import logging
 import os
 import threading
@@ -12,6 +13,7 @@ from typing import Optional, List
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+import defusedxml.ElementTree as DefusedET
 from defusedxml.ElementTree import ParseError
 import requests
 import shortuuid
@@ -256,7 +258,7 @@ class MetricsLogger:
 
 
 class EndpointHarvester:
-    def __init__(self, endpoint: Endpoint, db_session, batch_size=1000):
+    def __init__(self, endpoint: Endpoint, db_session, batch_size=5000):
         self.state = endpoint
         self.batch_size = batch_size
         self.db = db_session
@@ -320,29 +322,64 @@ class EndpointHarvester:
                         self.metrics.total_records = int(complete_list_size)
                         self.logger.info(f"Total records to harvest: {self.metrics.total_records}")
 
-            current_batch = []
-            batch_number = 1
-            first_record_in_batch = None
+            # Group records by date
+            records_by_date = {}
+            batch_counters = {}
+            current_date_processing = None  # Track current date for checkpoint-on-change
 
             for record in records:
                 self.metrics.increment_count()
                 self.metrics.update_datestamp(record.header.datestamp)
 
-                if not first_record_in_batch:
-                    first_record_in_batch = record
+                # Get date string for grouping (just the date part, no time)
+                datestamp = record.header.datestamp
+                date_key = datestamp.split('T')[0] if 'T' in datestamp else datestamp
 
-                current_batch.append(record)
+                # Checkpoint when date changes - previous date is now complete
+                # OAI-PMH records are generally in chronological order
+                if current_date_processing and date_key > current_date_processing:
+                    # Flush remaining records for the completed date
+                    if current_date_processing in records_by_date and records_by_date[current_date_processing]:
+                        self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
+                                        records_by_date[current_date_processing], current_date_processing)
+                        records_by_date[current_date_processing] = []
 
-                if len(current_batch) >= self.batch_size:
-                    self.save_batch(s3_client, s3_bucket, batch_number, current_batch, first_record_in_batch)
+                    # Checkpoint immediately - this date is complete
+                    checkpoint_dt = parse_datestamp(current_date_processing)
+                    if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
+                        self.state.most_recent_date_harvested = checkpoint_dt
+                        self.db.merge(self.state)
+                        self.db.commit()
+                        self.logger.info(f"Checkpoint: {current_date_processing} complete")
 
-                    # clear the current batch and reset tracking variables
-                    current_batch.clear()
-                    first_record_in_batch = None
-                    batch_number += 1
+                current_date_processing = date_key
 
-            if current_batch and first_record_in_batch:
-                self.save_batch(s3_client, s3_bucket, batch_number, current_batch, first_record_in_batch)
+                if date_key not in records_by_date:
+                    records_by_date[date_key] = []
+                    batch_counters[date_key] = 1
+
+                records_by_date[date_key].append(record)
+
+                # Save batch when it reaches batch_size
+                if len(records_by_date[date_key]) >= self.batch_size:
+                    self.save_batch(s3_client, s3_bucket, batch_counters[date_key],
+                                    records_by_date[date_key], date_key)
+                    records_by_date[date_key] = []
+                    batch_counters[date_key] += 1
+
+            # Final cleanup for the last date
+            if current_date_processing and records_by_date.get(current_date_processing):
+                self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
+                                records_by_date[current_date_processing], current_date_processing)
+
+            # Final checkpoint for the last date
+            if current_date_processing:
+                checkpoint_dt = parse_datestamp(current_date_processing)
+                if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
+                    self.state.most_recent_date_harvested = checkpoint_dt
+                    self.db.merge(self.state)
+                    self.db.commit()
+                    self.logger.info(f"Checkpoint: {current_date_processing} complete (final)")
 
         except NoRecordsMatch:
             self.logger.info(f"No records found for {self.state.pmh_url} with args {args}")
@@ -359,31 +396,41 @@ class EndpointHarvester:
         after=tenacity.after_log(LOGGER, logging.INFO),
         reraise=True
     )
-    def save_batch(self, s3_client, s3_bucket, batch_number, records, first_record):
+    def save_batch(self, s3_client, s3_bucket, batch_number, records, date_key):
+        """
+        Save a batch of records to S3. Returns the date_key on success for checkpoint tracking.
+        Does NOT update database state - caller is responsible for checkpointing.
+        """
         try:
-            date_path = self.get_datetime_path(first_record)
+            date_path = self.get_datetime_path(date_key)
+
+            # Generate content-based hash from sorted record identifiers
+            record_ids = sorted([r.header.identifier for r in records])
+            content_hash = hashlib.md5("".join(record_ids).encode()).hexdigest()[:12]
+            object_key = f"repositories/{self.state.id}/{date_path}/{content_hash}.xml.gz"
+
+            # Check if file already exists - skip if so (same records = same hash)
+            try:
+                s3_client.head_object(Bucket=s3_bucket, Key=object_key)
+                self.logger.info(f"Skipping existing batch: {object_key}")
+                return date_key
+            except ClientError as e:
+                if e.response['Error']['Code'] != '404':
+                    raise
+                # File doesn't exist, proceed with upload
+
             root = ET.Element('oai_records')
 
-            most_recent_date = parse_datestamp(first_record.header.datestamp)
-
             for record in records:
-                record_elem = ET.fromstring(record.raw)
+                record_elem = DefusedET.fromstring(record.raw)
                 root.append(record_elem)
-
-                # check if this record's date is more recent
-                record_date = parse_datestamp(record.header.datestamp)
-                if record_date > most_recent_date:
-                    most_recent_date = record_date
 
             xml_content = ET.tostring(root, encoding='unicode', method='xml')
             compressed_content = gzip.compress(xml_content.encode('utf-8'))
 
-            timestamp = int(parse_datestamp(first_record.header.datestamp).timestamp())
-            object_key = f"repositories/{self.state.id}/{date_path}/page_{batch_number}_{timestamp}.xml.gz"
-
             metadata = {
                 'record_count': str(len(records)),
-                'batch_number': str(batch_number),
+                'content_hash': content_hash,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
 
@@ -396,14 +443,7 @@ class EndpointHarvester:
             )
 
             self.logger.info(f"Uploaded batch {batch_number} to {object_key}")
-
-            # save checkpoint after every batch, using date - 1 day
-            checkpoint_date = most_recent_date - timedelta(days=1)
-            if not self.state.most_recent_date_harvested or checkpoint_date > self.state.most_recent_date_harvested:
-                self.state.most_recent_date_harvested = checkpoint_date
-                self.db.merge(self.state)
-                self.db.commit()
-                self.logger.info(f"Saved checkpoint at {checkpoint_date} (original date: {most_recent_date})")
+            return date_key
 
         except Exception as e:
             LOGGER.exception(f"Error saving batch {batch_number}")
@@ -443,7 +483,7 @@ class EndpointHarvester:
             return False
 
         try:
-            ET.fromstring(record)
+            DefusedET.fromstring(record)
             return True
         except ParseError as e:
             LOGGER.warning(f"Invalid XML record: {str(e)}")
@@ -479,10 +519,9 @@ class EndpointHarvester:
             LOGGER.error(f"Error getting earliest datestamp: {str(e)}")
             return datetime(2000, 1, 1)
 
-    def get_datetime_path(self, record):
-        """Get the date path for S3 storage"""
-        datestamp = record.header.datestamp
-        dt = parse_datestamp(datestamp)
+    def get_datetime_path(self, date_key):
+        """Get the date path for S3 storage from a date string (YYYY-MM-DD)"""
+        dt = parse_datestamp(date_key)
         return f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
 
     @tenacity.retry(
@@ -670,42 +709,13 @@ def parse_datestamp(datestamp_str):
         return datetime(2000, 1, 1)
 
 
-def harvest_endpoint(endpoint, s3_bucket, start_date, end_date, parallel_dates=1):
+def harvest_endpoint(endpoint, s3_bucket, start_date, end_date):
     logger = get_thread_logger()
     logger.info(f"Starting harvest for endpoint: {endpoint.pmh_url}")
     try:
         s = Session()
         harvester = EndpointHarvester(endpoint, s)
-
-        if parallel_dates == 1:
-            harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
-        else:
-            # Create single-day ranges instead of multi-day chunks
-            date_ranges = []
-            current = start_date
-            while current <= end_date:
-                # Each range is exactly one day (same start and end date)
-                date_ranges.append((current, current))
-                current = current + timedelta(days=1)
-
-            # Process up to parallel_dates number of single days concurrently
-            with ThreadPoolExecutor(max_workers=parallel_dates) as date_executor:
-                futures = []
-                for first, last in date_ranges:
-                    logger.info(f"Submitting single day: {first}")
-                    futures.append(date_executor.submit(harvester.harvest, s3_bucket, first, last))
-
-                for future in as_completed(futures):
-                    future.result()
-
-            # After all subtasks finish, update the final state
-            endpoint.last_harvest_finished = datetime.now(timezone.utc)
-            endpoint.most_recent_date_harvested = end_date
-            endpoint.error = None
-            endpoint.retry_at = None
-            endpoint.retry_interval = timedelta(minutes=5)
-            StateManager.update_endpoint_state(endpoint, s)
-
+        harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
         logger.info(f"Completed harvest for endpoint: {endpoint.pmh_url}")
     except Exception as e:
         logger.error(f"Error harvesting endpoint {endpoint.pmh_url}: {str(e)}")
@@ -729,9 +739,7 @@ def main():
     parser.add_argument('--abandoned-endpoints', action='store_true',
                         help='Harvest abandoned endpoints (retry_interval >= 30 days). Run monthly.')
     parser.add_argument('--n_threads', type=int, default=1,
-                        help='Number of concurrent harvesting threads')
-    parser.add_argument('--parallel-dates', type=int, default=1,
-                        help='Number of days to harvest in parallel for each endpoint')
+                        help='Number of concurrent harvesting threads (parallelizes across endpoints)')
 
     args = parser.parse_args()
 
@@ -796,8 +804,7 @@ def main():
                 endpoint,
                 S3_BUCKET,
                 first_date,
-                last_date,
-                args.parallel_dates
+                last_date
             )
             futures.append(future)
 
