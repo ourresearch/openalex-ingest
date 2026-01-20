@@ -26,7 +26,7 @@ def download_and_unzip_ror_data(url):
     r_zipfile.raise_for_status()
     with ZipFile(io.BytesIO(r_zipfile.content)) as myzip:
         for fname in myzip.namelist():
-            if "ror-data" in fname and fname.endswith(".json") and "schema_v2" in fname:
+            if fname.endswith(".json"):
                 with myzip.open(fname) as myfile:
                     ror_data = json.loads(myfile.read())
                     return ror_data, fname.split(".json")[0]
