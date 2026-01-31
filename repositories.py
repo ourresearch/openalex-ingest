@@ -1,4 +1,49 @@
+"""
+Repository OAI-PMH Harvester
+
+This module harvests metadata records from OAI-PMH repository endpoints
+and saves them to S3 for processing by the OpenAlex pipeline.
+
+SIMPLIFIED ARCHITECTURE (January 2026):
+The harvester runs a single daily job that harvests ALL ~6,000 endpoints
+in parallel (~15 minutes total). This replaced a complex 4-tier system
+that scheduled endpoints separately based on reliability.
+
+LEGACY COLUMNS (DO NOT USE):
+The following endpoint columns are historical artifacts from the old tiering
+system and are NOT used by the current harvester. They may be removed in a
+future migration:
+
+  - retry_interval: Was used for exponential backoff scheduling. Now ignored.
+  - retry_at: Was used for scheduling retries. Now ignored.
+  - is_core: Was used to prioritize "core" endpoints. Now ignored (all
+    endpoints are treated equally and harvested daily).
+
+These columns remain in the database because:
+1. Removing them requires a migration and we haven't prioritized cleanup
+2. They provide historical context about how endpoints were previously handled
+3. Some downstream queries may still reference them
+
+DO NOT add new logic that depends on these columns.
+
+CURRENT HEALTH TRACKING:
+The harvester now uses these columns to track endpoint health:
+
+  - last_health_status: Current status from most recent harvest attempt
+    Values: 'success', 'blocked', 'timeout', 'connection_error', 'malformed', 'oai_error'
+  - last_health_check: Timestamp of last harvest attempt
+  - last_response_time: Response time in seconds
+  - last_error_message: Error details if harvest failed
+
+PARALLELIZATION:
+- Uses ThreadPoolExecutor with 100 concurrent workers
+- Rate-limited to max 3 concurrent requests per host (prevents overloading)
+- 15-second timeout per request
+- Total runtime: ~15 minutes for all ~6,000 endpoints
+"""
+
 import argparse
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -8,8 +53,8 @@ import logging
 import os
 import threading
 from time import sleep, time
-from typing import Optional, List
-
+from typing import Optional, List, Tuple
+from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -22,16 +67,38 @@ from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
 from sickle.oaiexceptions import NoRecordsMatch
 from sickle.response import OAIResponse
-from sqlalchemy import Column, Text, DateTime, Boolean, Interval, and_, or_, select, func
+from sqlalchemy import Column, Text, DateTime, Boolean, Interval, Float, select
 import tenacity
 import xml.etree.ElementTree as ET
-
-from sqlalchemy.orm import selectinload
 
 from common import Base, LOGGER, S3_BUCKET, Session, db
 
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Parallelization settings
+MAX_WORKERS = 100           # Total concurrent harvesting threads
+MAX_PER_HOST = 3            # Max concurrent requests to same host
+REQUEST_TIMEOUT = 15        # Seconds before giving up on a request
+BATCH_SIZE = 5000           # Records per S3 file
+
+
+# =============================================================================
+# DATABASE MODEL
+# =============================================================================
+
 class Endpoint(Base):
+    """
+    Represents an OAI-PMH endpoint that we harvest metadata from.
+
+    LEGACY COLUMNS (not used by current harvester - see module docstring):
+      - retry_interval, retry_at, is_core
+
+    CURRENT HEALTH TRACKING:
+      - last_health_status, last_health_check, last_response_time, last_error_message
+    """
     __tablename__ = "endpoint"
 
     id = Column(Text, primary_key=True)
@@ -54,10 +121,19 @@ class Endpoint(Base):
     policy_promises_no_submitted_evidence = Column(Text)
     ready_to_run = Column(Boolean)
     metadata_prefix = Column(Text)
-    retry_interval = Column(Interval)
-    retry_at = Column(DateTime)
-    is_core = Column(Boolean)
     in_walden = Column(Boolean)
+
+    # LEGACY COLUMNS - DO NOT USE (see module docstring)
+    # These are from the old tiering system and are no longer used.
+    retry_interval = Column(Interval)  # LEGACY: was for exponential backoff
+    retry_at = Column(DateTime)         # LEGACY: was for scheduling retries
+    is_core = Column(Boolean)           # LEGACY: was for tiering priority
+
+    # CURRENT HEALTH TRACKING COLUMNS
+    last_health_status = Column(Text)     # success, blocked, timeout, connection_error, malformed, oai_error
+    last_health_check = Column(DateTime)  # when we last tested
+    last_response_time = Column(Float)    # seconds
+    last_error_message = Column(Text)     # details if failed
 
     def __init__(self, **kwargs):
         super(self.__class__, self).__init__(**kwargs)
@@ -67,146 +143,143 @@ class Endpoint(Base):
             self.metadata_prefix = 'oai_dc'
 
 
+# =============================================================================
+# STATE MANAGEMENT
+# =============================================================================
+
 class StateManager:
+    """
+    Database operations for endpoints.
+
+    The old tiering methods (get_core_endpoints, get_reliable_non_core_endpoints,
+    get_other_endpoints, get_abandoned_endpoints) have been removed. The new
+    approach simply harvests all endpoints daily using get_all_harvestable_endpoints().
+    """
+
     @staticmethod
     def get_endpoint(endpoint_id: str, session) -> Optional[Endpoint]:
-        stmt = select(Endpoint).options(selectinload('*')).filter_by(id=endpoint_id)
+        """Get a single endpoint by ID."""
+        stmt = select(Endpoint).filter_by(id=endpoint_id)
         return session.execute(stmt).scalar_one_or_none()
 
     @staticmethod
     def update_endpoint_state(state: Endpoint, session):
+        """Update an endpoint's state in the database."""
         session.merge(state)
         session.commit()
 
     @staticmethod
-    def get_core_endpoints(session) -> List[Endpoint]:
-        now = datetime.now(timezone.utc)
-        stmt = select(Endpoint).options(selectinload('*')).filter(
-            Endpoint.ready_to_run == True,
-            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.is_core == True,
-            Endpoint.in_walden == True
-        )
-        return list(session.execute(stmt).scalars().all())
-
-    @staticmethod
-    def get_reliable_non_core_endpoints(session) -> List[Endpoint]:
+    def get_all_harvestable_endpoints(session) -> List[Endpoint]:
         """
-        Get non-core endpoints that have been working properly recently.
+        Get all endpoints that should be harvested.
+
         Criteria:
-        - Not core endpoints but ready to run
-        - Have successfully completed a harvest within the last 365 days
-        - Have a reasonable retry interval (not too long)
+        - ready_to_run == True
+        - in_walden == True (part of OpenAlex pipeline)
+
+        Unlike the old tiering system, this returns ALL harvestable endpoints.
+        The parallelization handles the load efficiently.
+
+        Uses yield_per() to avoid loading all 6K+ rows into memory at once.
         """
-        now = datetime.now(timezone.utc)
-        last_harvested_cutoff = now - timedelta(days=365)
-        recent_cutoff = now - timedelta(hours=1)  # Consider 1 hour as "recent"
-
-        stmt = select(Endpoint).options(selectinload('*')).filter(
+        stmt = select(Endpoint).filter(
             Endpoint.ready_to_run == True,
-            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            or_(Endpoint.is_core == False, Endpoint.is_core == None),
-            Endpoint.in_walden == True,
-            Endpoint.last_harvest_finished != None,
-            Endpoint.last_harvest_finished > last_harvested_cutoff,
-            Endpoint.most_recent_date_harvested != None,
-            Endpoint.most_recent_date_harvested > last_harvested_cutoff,
-            Endpoint.retry_interval < timedelta(days=7),
-            or_(
-                Endpoint.last_harvest_started == None,
-                and_(
-                    Endpoint.last_harvest_started < recent_cutoff,
-                    or_(
-                        Endpoint.last_harvest_finished != None,
-                        Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
-                        # Assume stalled after 4 hours
-                    )
-                )
-            )
-        ).order_by(Endpoint.last_harvest_finished.desc())
-
-        return list(session.execute(stmt).scalars().all())
+            Endpoint.in_walden == True
+        ).execution_options(yield_per=500)
+        return list(session.execute(stmt).scalars())
 
     @staticmethod
-    def get_other_endpoints(session) -> List[Endpoint]:
+    def update_health_status(
+        endpoint: Endpoint,
+        session,
+        status: str,
+        response_time: float,
+        error_message: Optional[str] = None
+    ):
         """
-        Get remaining non-core endpoints that are not in the reliable category.
-        These are endpoints that we still want to try but might be problematic.
+        Update endpoint health tracking columns after a harvest attempt.
+
+        Args:
+            endpoint: The endpoint to update
+            session: Database session
+            status: One of 'success', 'blocked', 'timeout', 'connection_error',
+                   'malformed', 'oai_error'
+            response_time: How long the request took in seconds
+            error_message: Error details if status is not 'success'
         """
-        now = datetime.now(timezone.utc)
-        recent_cutoff = now - timedelta(hours=1)  # Consider 1 hour as "recent"
+        endpoint.last_health_status = status
+        endpoint.last_health_check = datetime.now(timezone.utc)
+        endpoint.last_response_time = response_time
+        endpoint.last_error_message = error_message
+        session.merge(endpoint)
+        session.commit()
 
-        reliable_ids = [ep.id for ep in StateManager.get_reliable_non_core_endpoints(session)]
 
-        stmt = select(Endpoint).options(selectinload('*')).filter(
-            Endpoint.ready_to_run == True,
-            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.retry_interval < timedelta(days=30),
-            or_(Endpoint.is_core == False, Endpoint.is_core == None),
-            Endpoint.in_walden == True,
-            Endpoint.id.notin_(reliable_ids) if reliable_ids else True,
-            or_(
-                Endpoint.last_harvest_started == None,
-                and_(
-                    Endpoint.last_harvest_started < recent_cutoff,
-                    or_(
-                        Endpoint.last_harvest_finished != None,
-                        Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
-                    )
-                )
-            )
-        ).order_by(func.random())
+# =============================================================================
+# RATE LIMITING
+# =============================================================================
 
-        return list(session.execute(stmt).scalars().all())
+class HostRateLimiter:
+    """
+    Per-host rate limiting using semaphores.
 
-    @staticmethod
-    def get_abandoned_endpoints(session) -> List[Endpoint]:
-        """
-        Get endpoints that have been abandoned due to too many failures.
-        These have retry_interval >= 30 days and are not picked up by other queries.
-        Run monthly to give them another chance.
-        """
-        now = datetime.now(timezone.utc)
-        recent_cutoff = now - timedelta(hours=1)
+    Prevents overwhelming any single host with too many concurrent requests.
+    Each host gets a semaphore allowing MAX_PER_HOST concurrent connections.
+    """
 
-        stmt = select(Endpoint).options(selectinload('*')).filter(
-            Endpoint.ready_to_run == True,
-            or_(Endpoint.retry_at == None, Endpoint.retry_at <= now),
-            Endpoint.retry_interval >= timedelta(days=30),
-            or_(Endpoint.is_core == False, Endpoint.is_core == None),
-            Endpoint.in_walden == True,
-            or_(
-                Endpoint.last_harvest_started == None,
-                and_(
-                    Endpoint.last_harvest_started < recent_cutoff,
-                    or_(
-                        Endpoint.last_harvest_finished != None,
-                        Endpoint.last_harvest_started < recent_cutoff - timedelta(hours=3)
-                    )
-                )
-            )
-        ).order_by(func.random())
+    def __init__(self, max_per_host: int = MAX_PER_HOST):
+        self.max_per_host = max_per_host
+        self._semaphores = defaultdict(lambda: threading.Semaphore(self.max_per_host))
+        self._lock = threading.Lock()
 
-        return list(session.execute(stmt).scalars().all())
+    def get_semaphore(self, url: str) -> threading.Semaphore:
+        """Get the semaphore for a URL's host."""
+        host = urlparse(url).hostname
+        with self._lock:
+            return self._semaphores[host]
 
+    @contextmanager
+    def limit(self, url: str):
+        """Context manager that acquires/releases the host's semaphore."""
+        semaphore = self.get_semaphore(url)
+        semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
+
+
+# Global rate limiter instance
+host_rate_limiter = HostRateLimiter()
+
+
+# =============================================================================
+# THREAD-LOCAL LOGGING
+# =============================================================================
 
 thread_local = threading.local()
 
 def get_thread_logger():
+    """Get a logger for the current thread."""
     if not hasattr(thread_local, "logger"):
         thread_local.logger = logging.getLogger(f"harvester.{threading.current_thread().name}")
-        # Only add handler if no handlers exist
         if not thread_local.logger.handlers:
             handler = logging.StreamHandler()
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             handler.setFormatter(formatter)
             thread_local.logger.addHandler(handler)
             thread_local.logger.setLevel(logging.INFO)
-            # Prevent propagation to avoid double logging
             thread_local.logger.propagate = False
     return thread_local.logger
 
+
+# =============================================================================
+# METRICS LOGGING
+# =============================================================================
+
 class MetricsLogger:
+    """Logs harvesting metrics at regular intervals."""
+
     def __init__(self, interval=5):
         self.interval = interval
         self.record_count = 0
@@ -257,8 +330,14 @@ class MetricsLogger:
             sleep(self.interval)
 
 
+# =============================================================================
+# ENDPOINT HARVESTER
+# =============================================================================
+
 class EndpointHarvester:
-    def __init__(self, endpoint: Endpoint, db_session, batch_size=5000):
+    """Harvests records from a single OAI-PMH endpoint."""
+
+    def __init__(self, endpoint: Endpoint, db_session, batch_size=BATCH_SIZE):
         self.state = endpoint
         self.batch_size = batch_size
         self.db = db_session
@@ -284,7 +363,6 @@ class EndpointHarvester:
         try:
             self.metrics.start()
             with self._get_s3_client() as s3_client:
-                # One call for the entire range
                 self.call_pmh_endpoint(
                     s3_client=s3_client,
                     s3_bucket=s3_bucket,
@@ -325,26 +403,22 @@ class EndpointHarvester:
             # Group records by date
             records_by_date = {}
             batch_counters = {}
-            current_date_processing = None  # Track current date for checkpoint-on-change
+            current_date_processing = None
 
             for record in records:
                 self.metrics.increment_count()
                 self.metrics.update_datestamp(record.header.datestamp)
 
-                # Get date string for grouping (just the date part, no time)
                 datestamp = record.header.datestamp
                 date_key = datestamp.split('T')[0] if 'T' in datestamp else datestamp
 
-                # Checkpoint when date changes - previous date is now complete
-                # OAI-PMH records are generally in chronological order
+                # Checkpoint when date changes
                 if current_date_processing and date_key > current_date_processing:
-                    # Flush remaining records for the completed date
                     if current_date_processing in records_by_date and records_by_date[current_date_processing]:
                         self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
                                         records_by_date[current_date_processing], current_date_processing)
                         records_by_date[current_date_processing] = []
 
-                    # Checkpoint immediately - this date is complete
                     checkpoint_dt = parse_datestamp(current_date_processing)
                     if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
                         self.state.most_recent_date_harvested = checkpoint_dt
@@ -360,19 +434,17 @@ class EndpointHarvester:
 
                 records_by_date[date_key].append(record)
 
-                # Save batch when it reaches batch_size
                 if len(records_by_date[date_key]) >= self.batch_size:
                     self.save_batch(s3_client, s3_bucket, batch_counters[date_key],
                                     records_by_date[date_key], date_key)
                     records_by_date[date_key] = []
                     batch_counters[date_key] += 1
 
-            # Final cleanup for the last date
+            # Final cleanup
             if current_date_processing and records_by_date.get(current_date_processing):
                 self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
                                 records_by_date[current_date_processing], current_date_processing)
 
-            # Final checkpoint for the last date
             if current_date_processing:
                 checkpoint_dt = parse_datestamp(current_date_processing)
                 if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
@@ -386,6 +458,30 @@ class EndpointHarvester:
 
         except Exception as e:
             self.state.error = f"Error harvesting records: {str(e)}"
+
+            # Save partial progress before raising
+            # This ensures we don't re-harvest dates we've already completed
+            try:
+                # Save any pending records for the current date
+                if 'current_date_processing' in dir() and current_date_processing:
+                    if 'records_by_date' in dir() and records_by_date.get(current_date_processing):
+                        batch_num = batch_counters.get(current_date_processing, 1)
+                        self.save_batch(s3_client, s3_bucket, batch_num,
+                                        records_by_date[current_date_processing], current_date_processing)
+                        self.logger.info(f"Saved partial batch for {current_date_processing} before error")
+
+                    # Update checkpoint to last completed date (one before current)
+                    # We don't checkpoint the current date since it may be incomplete
+                    checkpoint_dt = parse_datestamp(current_date_processing) - timedelta(days=1)
+                    if checkpoint_dt > datetime(2000, 1, 1):
+                        if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
+                            self.state.most_recent_date_harvested = checkpoint_dt
+                            self.db.merge(self.state)
+                            self.db.commit()
+                            self.logger.info(f"Saved checkpoint at {checkpoint_dt.date()} before error")
+            except Exception as save_error:
+                self.logger.warning(f"Failed to save partial progress: {save_error}")
+
             raise
 
     @tenacity.retry(
@@ -397,19 +493,14 @@ class EndpointHarvester:
         reraise=True
     )
     def save_batch(self, s3_client, s3_bucket, batch_number, records, date_key):
-        """
-        Save a batch of records to S3. Returns the date_key on success for checkpoint tracking.
-        Does NOT update database state - caller is responsible for checkpointing.
-        """
+        """Save a batch of records to S3."""
         try:
             date_path = self.get_datetime_path(date_key)
 
-            # Generate content-based hash from sorted record identifiers
             record_ids = sorted([r.header.identifier for r in records])
             content_hash = hashlib.md5("".join(record_ids).encode()).hexdigest()[:12]
             object_key = f"repositories/{self.state.id}/{date_path}/{content_hash}.xml.gz"
 
-            # Check if file already exists - skip if so (same records = same hash)
             try:
                 s3_client.head_object(Bucket=s3_bucket, Key=object_key)
                 self.logger.info(f"Skipping existing batch: {object_key}")
@@ -417,7 +508,6 @@ class EndpointHarvester:
             except ClientError as e:
                 if e.response['Error']['Code'] != '404':
                     raise
-                # File doesn't exist, proceed with upload
 
             root = ET.Element('oai_records')
 
@@ -459,9 +549,7 @@ class EndpointHarvester:
             pass
 
     def detect_date_format(self):
-        """
-        Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'.
-        """
+        """Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'."""
         try:
             my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
             identify = my_sickle.Identify()
@@ -502,17 +590,14 @@ class EndpointHarvester:
             if earliest:
                 try:
                     if 'T' in earliest:
-                        return datetime.strptime(earliest,
-                                                          '%Y-%m-%dT%H:%M:%SZ')
+                        return datetime.strptime(earliest, '%Y-%m-%dT%H:%M:%SZ')
                     else:
                         return datetime.strptime(earliest, '%Y-%m-%d')
                 except ValueError:
-                    LOGGER.warning(
-                        f"Could not parse earliest datestamp: {earliest}")
+                    LOGGER.warning(f"Could not parse earliest datestamp: {earliest}")
                     return datetime(2000, 1, 1)
             else:
-                LOGGER.warning(
-                    "No earliest datestamp found in Identify response")
+                LOGGER.warning("No earliest datestamp found in Identify response")
                 return datetime(2000, 1, 1)
 
         except Exception as e:
@@ -536,6 +621,10 @@ class EndpointHarvester:
         return sickle.ListRecords(**kwargs)
 
 
+# =============================================================================
+# SICKLE OAI-PMH CLIENT CUSTOMIZATIONS
+# =============================================================================
+
 class MyOAIItemIterator(OAIItemIterator):
     def _get_resumption_token(self):
         resumption_token_element = self.oai_response.xml.find(
@@ -545,10 +634,8 @@ class MyOAIItemIterator(OAIItemIterator):
 
         token = resumption_token_element.text
         cursor = resumption_token_element.attrib.get('cursor', None)
-        complete_list_size = resumption_token_element.attrib.get(
-            'completeListSize', None)
-        expiration_date = resumption_token_element.attrib.get('expirationDate',
-                                                              None)
+        complete_list_size = resumption_token_element.attrib.get('completeListSize', None)
+        expiration_date = resumption_token_element.attrib.get('expirationDate', None)
 
         return ResumptionToken(
             token=token,
@@ -559,27 +646,23 @@ class MyOAIItemIterator(OAIItemIterator):
 
 
 class OSTIItemIterator(MyOAIItemIterator):
-    def _next_response(self):
-        """Get the next response from the OAI server.
+    """Special handling for OSTI which needs metadataPrefix included with resumptionToken."""
 
-        Special handling for OSTI which needs metadataPrefix included with resumptionToken.
-        """
+    def _next_response(self):
         params = self.params
         if self.resumption_token:
             params = {
                 'resumptionToken': self.resumption_token.token,
                 'verb': self.verb,
-                'metadataPrefix': params.get('metadataPrefix')  # Include metadataPrefix for OSTI
+                'metadataPrefix': params.get('metadataPrefix')
             }
         self.oai_response = self.sickle.harvest(**params)
-        error = self.oai_response.xml.find(
-            './/' + self.sickle.oai_namespace + 'error')
+        error = self.oai_response.xml.find('.//' + self.sickle.oai_namespace + 'error')
         if error is not None:
             code = error.attrib.get('code', 'UNKNOWN')
             description = error.text or ''
             try:
-                raise getattr(
-                    oaiexceptions, code[0].upper() + code[1:])(description)
+                raise getattr(oaiexceptions, code[0].upper() + code[1:])(description)
             except AttributeError:
                 raise oaiexceptions.OAIError(description)
         self.resumption_token = self._get_resumption_token()
@@ -588,6 +671,8 @@ class OSTIItemIterator(MyOAIItemIterator):
 
 
 class MySickle(Sickle):
+    """Custom Sickle client with retry logic and special handling."""
+
     DEFAULT_RETRY_SECONDS = 5
 
     def __init__(self, *args, **kwargs):
@@ -648,7 +733,6 @@ class MySickle(Sickle):
 
                 http_response.raise_for_status()
 
-                # validate response content
                 if not http_response.text.strip():
                     raise Exception("Empty response received from server")
                 response_start = http_response.text.strip()[:100].lower()
@@ -658,7 +742,6 @@ class MySickle(Sickle):
                 if self.encoding:
                     http_response.encoding = self.encoding
 
-                # successful response
                 return OAIResponse(http_response, params=kwargs)
 
             except Exception as e:
@@ -671,13 +754,13 @@ class MySickle(Sickle):
         raise Exception(f"Failed to harvest after {self.max_retries} retries")
 
 
-def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=120):
+def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=REQUEST_TIMEOUT):
+    """Create a customized Sickle client for the given URL."""
     if not repo_pmh_url:
         return None
 
     proxy_url = None
-    if any(fragment in repo_pmh_url for fragment in
-           ["citeseerx", "pure.coventry.ac.uk"]):
+    if any(fragment in repo_pmh_url for fragment in ["citeseerx", "pure.coventry.ac.uk"]):
         proxy_url = os.getenv("STATIC_IP_PROXY")
 
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else {}
@@ -690,15 +773,20 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=120):
     return sickle
 
 
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
 def parse_date(date_str: str):
+    """Parse a date string from command line argument."""
     try:
         return datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"Invalid date format: {date_str}. Use YYYY-MM-DD")
+        raise argparse.ArgumentTypeError(f"Invalid date format: {date_str}. Use YYYY-MM-DD")
 
 
 def parse_datestamp(datestamp_str):
+    """Parse an OAI-PMH datestamp."""
     try:
         if 'T' in datestamp_str:
             return datetime.strptime(datestamp_str, '%Y-%m-%dT%H:%M:%SZ')
@@ -709,37 +797,280 @@ def parse_datestamp(datestamp_str):
         return datetime(2000, 1, 1)
 
 
-def harvest_endpoint(endpoint, s3_bucket, start_date, end_date):
-    logger = get_thread_logger()
-    logger.info(f"Starting harvest for endpoint: {endpoint.pmh_url}")
-    try:
-        s = Session()
-        harvester = EndpointHarvester(endpoint, s)
-        harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
-        logger.info(f"Completed harvest for endpoint: {endpoint.pmh_url}")
-    except Exception as e:
-        logger.error(f"Error harvesting endpoint {endpoint.pmh_url}: {str(e)}")
-        raise
+def classify_error(error: Exception) -> str:
+    """
+    Classify an exception into a health status category.
 
+    Returns one of: 'timeout', 'connection_error', 'blocked', 'malformed', 'oai_error'
+    """
+    error_str = str(error).lower()
+    error_type = type(error).__name__
+
+    if isinstance(error, requests.exceptions.Timeout):
+        return 'timeout'
+    elif isinstance(error, requests.exceptions.ConnectionError):
+        return 'connection_error'
+    elif isinstance(error, requests.exceptions.HTTPError):
+        if '403' in error_str or '401' in error_str:
+            return 'blocked'
+        return 'connection_error'
+    elif 'timeout' in error_str:
+        return 'timeout'
+    elif 'connection' in error_str or 'refused' in error_str:
+        return 'connection_error'
+    elif 'blocked' in error_str or 'forbidden' in error_str:
+        return 'blocked'
+    elif 'xml' in error_str or 'parse' in error_str:
+        return 'malformed'
+    elif isinstance(error, oaiexceptions.OAIError):
+        return 'oai_error'
+    else:
+        return 'connection_error'  # Default fallback
+
+
+# =============================================================================
+# MAIN HARVESTING LOGIC
+# =============================================================================
+
+def harvest_single_endpoint(
+    endpoint_id: str,
+    pmh_url: str,
+    s3_bucket: str,
+    start_date,
+    end_date
+) -> Tuple[str, str, float, Optional[str]]:
+    """
+    Harvest a single endpoint with rate limiting and health tracking.
+
+    Args:
+        endpoint_id: The endpoint ID to harvest
+        pmh_url: The PMH URL for rate limiting (avoids loading endpoint before acquiring lock)
+        s3_bucket: S3 bucket for storing records
+        start_date: Start date for harvesting
+        end_date: End date for harvesting
+
+    Returns:
+        Tuple of (endpoint_id, status, response_time, error_message)
+    """
+    logger = get_thread_logger()
+    start_time = time()
+
+    # Apply per-host rate limiting
+    with host_rate_limiter.limit(pmh_url):
+        logger.info(f"Starting harvest for endpoint: {pmh_url}")
+
+        # Use context manager to ensure session is always closed
+        with Session() as session:
+            try:
+                # Load endpoint fresh within this thread's session
+                endpoint = StateManager.get_endpoint(endpoint_id, session)
+                if not endpoint:
+                    logger.error(f"Endpoint not found: {endpoint_id}")
+                    return (endpoint_id, 'connection_error', 0.0, "Endpoint not found")
+
+                harvester = EndpointHarvester(endpoint, session)
+                harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
+
+                response_time = time() - start_time
+                logger.info(f"Completed harvest for endpoint: {pmh_url} in {response_time:.2f}s")
+
+                # Update health status (using same session)
+                StateManager.update_health_status(
+                    endpoint, session,
+                    status='success',
+                    response_time=response_time
+                )
+
+                return (endpoint_id, 'success', response_time, None)
+
+            except NoRecordsMatch:
+                # No records is still a successful connection
+                response_time = time() - start_time
+                # Re-fetch endpoint if needed (in case it wasn't loaded due to early exception)
+                if 'endpoint' not in locals():
+                    endpoint = StateManager.get_endpoint(endpoint_id, session)
+                if endpoint:
+                    StateManager.update_health_status(
+                        endpoint, session,
+                        status='success',
+                        response_time=response_time
+                    )
+                return (endpoint_id, 'success', response_time, None)
+
+            except Exception as e:
+                response_time = time() - start_time
+                error_message = str(e)
+                status = classify_error(e)
+
+                logger.error(f"Error harvesting endpoint {pmh_url}: {error_message}")
+
+                try:
+                    # Re-fetch endpoint if needed
+                    if 'endpoint' not in locals():
+                        endpoint = StateManager.get_endpoint(endpoint_id, session)
+                    if endpoint:
+                        StateManager.update_health_status(
+                            endpoint, session,
+                            status=status,
+                            response_time=response_time,
+                            error_message=error_message[:1000]  # Truncate long errors
+                        )
+                except Exception as db_error:
+                    logger.error(f"Failed to update health status: {db_error}")
+
+                return (endpoint_id, status, response_time, error_message)
+
+
+def harvest_single_endpoint_with_date_detection(
+    endpoint_id: str,
+    pmh_url: str,
+    s3_bucket: str,
+    start_date,
+    end_date
+) -> Tuple[str, str, float, Optional[str]]:
+    """
+    Harvest a single endpoint, detecting earliest datestamp if start_date is None.
+
+    This is used when --start-date is not provided and the endpoint has never been
+    harvested before. The earliest datestamp detection happens inside the thread
+    to avoid blocking the main thread.
+
+    Args:
+        endpoint_id: The endpoint ID to harvest
+        pmh_url: The PMH URL for rate limiting
+        s3_bucket: S3 bucket for storing records
+        start_date: Start date for harvesting, or None to detect earliest datestamp
+        end_date: End date for harvesting
+
+    Returns:
+        Tuple of (endpoint_id, status, response_time, error_message)
+    """
+    logger = get_thread_logger()
+
+    if start_date is None:
+        # Detect earliest datestamp for new endpoints
+        try:
+            with Session() as session:
+                endpoint = StateManager.get_endpoint(endpoint_id, session)
+                if endpoint:
+                    harvester = EndpointHarvester(endpoint, session)
+                    start_date = harvester.get_earliest_datestamp().date()
+                else:
+                    start_date = datetime(2000, 1, 1).date()
+        except Exception as e:
+            logger.warning(f"Failed to get earliest datestamp for {pmh_url}: {e}")
+            start_date = datetime(2000, 1, 1).date()
+
+    return harvest_single_endpoint(endpoint_id, pmh_url, s3_bucket, start_date, end_date)
+
+
+def harvest_all_endpoints(
+    endpoint_data: List[Tuple[str, str]],
+    s3_bucket: str,
+    start_date,
+    end_date,
+    max_workers: int = MAX_WORKERS
+) -> dict:
+    """
+    Harvest all endpoints in parallel with rate limiting.
+
+    Args:
+        endpoint_data: List of (endpoint_id, pmh_url) tuples
+        s3_bucket: S3 bucket for storing records
+        start_date: Start date for harvesting
+        end_date: End date for harvesting
+        max_workers: Maximum concurrent threads
+
+    Returns:
+        Dict with harvest statistics
+    """
+    logger = logging.getLogger("harvester.main")
+    logger.info(f"Starting parallel harvest of {len(endpoint_data)} endpoints with {max_workers} workers")
+
+    stats = {
+        'total': len(endpoint_data),
+        'success': 0,
+        'blocked': 0,
+        'timeout': 0,
+        'connection_error': 0,
+        'malformed': 0,
+        'oai_error': 0,
+        'total_time': 0
+    }
+
+    start_time = time()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                harvest_single_endpoint,
+                endpoint_id,
+                pmh_url,
+                s3_bucket,
+                start_date,
+                end_date
+            ): (endpoint_id, pmh_url)
+            for endpoint_id, pmh_url in endpoint_data
+        }
+
+        for future in as_completed(futures):
+            endpoint_id, pmh_url = futures[future]
+            try:
+                result_id, status, response_time, error_msg = future.result()
+                stats[status] = stats.get(status, 0) + 1
+            except Exception as e:
+                logger.error(f"Unexpected error for endpoint {pmh_url}: {e}")
+                stats['connection_error'] += 1
+
+    stats['total_time'] = time() - start_time
+
+    logger.info(f"Harvest complete in {stats['total_time']:.2f}s")
+    logger.info(f"Results: {stats['success']} success, {stats['blocked']} blocked, "
+                f"{stats['timeout']} timeout, {stats['connection_error']} connection errors, "
+                f"{stats['malformed']} malformed, {stats['oai_error']} OAI errors")
+
+    return stats
+
+
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='OAI-PMH Repository Harvester')
+    parser = argparse.ArgumentParser(
+        description='OAI-PMH Repository Harvester',
+        epilog="""
+Examples:
+  # Harvest all endpoints (daily job)
+  python repositories.py --all-endpoints --n_threads 100
+
+  # Harvest a specific endpoint
+  python repositories.py --endpoint-id abc123
+
+  # Harvest with custom date range
+  python repositories.py --all-endpoints --start-date 2026-01-01 --end-date 2026-01-15
+        """
+    )
 
     parser.add_argument('--endpoint-id', help='Specific endpoint ID to harvest')
     parser.add_argument('--start-date', type=parse_date,
                         help='Start date in YYYY-MM-DD format.')
     parser.add_argument('--end-date', type=parse_date,
                         help='End date in YYYY-MM-DD format.')
+    parser.add_argument('--all-endpoints', action='store_true',
+                        help='Harvest all harvestable endpoints (recommended for daily job)')
+    parser.add_argument('--n_threads', type=int, default=MAX_WORKERS,
+                        help=f'Number of concurrent harvesting threads (default: {MAX_WORKERS})')
+
+    # Legacy flags (kept for backwards compatibility but deprecated)
     parser.add_argument('--core-endpoints', action='store_true',
-                        help='Harvest core endpoints only')
+                        help='DEPRECATED: Use --all-endpoints instead. All endpoints are now treated equally.')
     parser.add_argument('--reliable-endpoints', action='store_true',
-                        help='Harvest reliable non-core endpoints only')
+                        help='DEPRECATED: Use --all-endpoints instead. All endpoints are now treated equally.')
     parser.add_argument('--other-endpoints', action='store_true',
-                        help='Harvest other less reliable endpoints only')
+                        help='DEPRECATED: Use --all-endpoints instead. All endpoints are now treated equally.')
     parser.add_argument('--abandoned-endpoints', action='store_true',
-                        help='Harvest abandoned endpoints (retry_interval >= 30 days). Run monthly.')
-    parser.add_argument('--n_threads', type=int, default=1,
-                        help='Number of concurrent harvesting threads (parallelizes across endpoints)')
+                        help='DEPRECATED: Use --all-endpoints instead. All endpoints are now treated equally.')
 
     args = parser.parse_args()
 
@@ -750,69 +1081,99 @@ def main():
     )
     logger = logging.getLogger("harvester.main")
 
+    # Handle deprecated flags
+    if any([args.core_endpoints, args.reliable_endpoints, args.other_endpoints, args.abandoned_endpoints]):
+        logger.warning("DEPRECATED: Tier-based flags are deprecated. The harvester now treats all endpoints equally.")
+        logger.warning("Using --all-endpoints behavior instead.")
+        args.all_endpoints = True
+
+    # Load endpoints and extract IDs + URLs (don't pass ORM objects to threads)
     if args.endpoint_id:
         endpoint = StateManager.get_endpoint(args.endpoint_id, db)
         if not endpoint:
             logger.error(f"No endpoint found with ID: {args.endpoint_id}")
             return
-        endpoints = [endpoint]
-    elif args.core_endpoints:
-        endpoints = StateManager.get_core_endpoints(db)
-        logger.info(f"Found {len(endpoints)} core endpoints ready to harvest")
-    elif args.reliable_endpoints:
-        endpoints = StateManager.get_reliable_non_core_endpoints(db)
-        logger.info(f"Found {len(endpoints)} reliable non-core endpoints ready to harvest")
-    elif args.other_endpoints:
-        endpoints = StateManager.get_other_endpoints(db)
-        logger.info(f"Found {len(endpoints)} other endpoints ready to harvest")
-    elif args.abandoned_endpoints:
-        endpoints = StateManager.get_abandoned_endpoints(db)
-        logger.info(f"Found {len(endpoints)} abandoned endpoints to retry")
+        # Extract data we need, then let the ORM object go
+        endpoint_data = [(endpoint.id, endpoint.pmh_url, endpoint.most_recent_date_harvested)]
+        logger.info(f"Harvesting single endpoint: {endpoint.pmh_url}")
+    elif args.all_endpoints:
+        endpoints = StateManager.get_all_harvestable_endpoints(db)
+        endpoint_data = [(e.id, e.pmh_url, e.most_recent_date_harvested) for e in endpoints]
+        logger.info(f"Found {len(endpoint_data)} harvestable endpoints")
     else:
-        # By default, harvest all endpoint types
-        core_endpoints = StateManager.get_core_endpoints(db)
-        reliable_endpoints = StateManager.get_reliable_non_core_endpoints(db)
-        other_endpoints = StateManager.get_other_endpoints(db)
+        # Default to all endpoints
+        endpoints = StateManager.get_all_harvestable_endpoints(db)
+        endpoint_data = [(e.id, e.pmh_url, e.most_recent_date_harvested) for e in endpoints]
+        logger.info(f"Found {len(endpoint_data)} harvestable endpoints (use --all-endpoints to suppress this message)")
 
-        endpoints = core_endpoints + reliable_endpoints + other_endpoints
+    if not endpoint_data:
+        logger.warning("No endpoints to harvest")
+        return
 
-        logger.info(f"Found {len(core_endpoints)} core endpoints, " +
-                    f"{len(reliable_endpoints)} reliable non-core endpoints, and " +
-                    f"{len(other_endpoints)} other endpoints ready to harvest")
+    # Determine date range
+    end_date = args.end_date or (datetime.now(timezone.utc).date() - timedelta(days=1))
 
-    with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
-        futures = []
+    if args.start_date:
+        # Use specified start date for all endpoints
+        start_date = args.start_date
 
-        for endpoint in endpoints:
-            if args.start_date:
-                first_date = args.start_date
-            else:
-                harvester = EndpointHarvester(endpoint, db)
-                first_date = (
-                    endpoint.most_recent_date_harvested.date() - timedelta(
-                        days=1)
-                    if endpoint.most_recent_date_harvested
-                    else harvester.get_earliest_datestamp().date()
-                         or datetime(2000, 1, 1).date()
+        # Extract just (id, url) for harvest_all_endpoints
+        harvest_data = [(eid, url) for eid, url, _ in endpoint_data]
+
+        # Harvest all endpoints in parallel
+        stats = harvest_all_endpoints(
+            endpoint_data=harvest_data,
+            s3_bucket=S3_BUCKET,
+            start_date=start_date,
+            end_date=end_date,
+            max_workers=args.n_threads
+        )
+    else:
+        # Compute per-endpoint start dates based on most_recent_date_harvested
+        # Start date computation now happens inside each thread for new endpoints
+        logger.info("Harvesting with per-endpoint date ranges...")
+
+        with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
+            futures = {}
+
+            for endpoint_id, pmh_url, most_recent in endpoint_data:
+                if most_recent:
+                    first_date = most_recent.date() - timedelta(days=1)
+                else:
+                    # For new endpoints, we'll compute earliest datestamp inside the thread
+                    # to avoid blocking the main thread. Pass None and handle in worker.
+                    first_date = None
+
+                future = executor.submit(
+                    harvest_single_endpoint_with_date_detection,
+                    endpoint_id,
+                    pmh_url,
+                    S3_BUCKET,
+                    first_date,
+                    end_date
                 )
+                futures[future] = (endpoint_id, pmh_url)
 
-            last_date = args.end_date or (
-                        datetime.now(timezone.utc).date() - timedelta(days=1))
+            stats = {
+                'total': len(endpoint_data),
+                'success': 0,
+                'blocked': 0,
+                'timeout': 0,
+                'connection_error': 0,
+                'malformed': 0,
+                'oai_error': 0
+            }
 
-            future = executor.submit(
-                harvest_endpoint,
-                endpoint,
-                S3_BUCKET,
-                first_date,
-                last_date
-            )
-            futures.append(future)
+            for future in as_completed(futures):
+                endpoint_id, pmh_url = futures[future]
+                try:
+                    result_id, status, response_time, error_msg = future.result()
+                    stats[status] = stats.get(status, 0) + 1
+                except Exception as e:
+                    logger.error(f"Harvesting task failed for {pmh_url}: {str(e)}")
+                    stats['connection_error'] += 1
 
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Harvesting task failed: {str(e)}")
+        logger.info(f"Harvest complete: {stats}")
 
 
 if __name__ == "__main__":
