@@ -31,7 +31,13 @@ def get_database_url():
         return database_url.replace('postgres:', 'postgresql:', 1)
     return database_url
 
-engine = sqlalchemy.create_engine(get_database_url())
+engine = sqlalchemy.create_engine(
+    get_database_url(),
+    pool_size=20,       # Base pool connections
+    max_overflow=80,    # Additional overflow connections (total 100 for 100 threads)
+    pool_timeout=60,    # Wait up to 60s for a connection (default is 30s)
+    pool_pre_ping=True  # Verify connections are alive before using
+)
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 db = Session()
