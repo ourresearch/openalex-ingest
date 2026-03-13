@@ -372,6 +372,33 @@ class EndpointHarvester:
         finally:
             self.metrics.stop()
 
+    def _iter_records_safe(self, records):
+        """Iterate over OAI records, skipping any that fail to parse.
+
+        Some OAI endpoints serve records that are not marked as deleted but
+        have empty <metadata></metadata> elements (e.g. RWTH Aachen record
+        oai:publications.rwth-aachen.de:52515). Sickle's Record.__init__
+        calls .getchildren()[0] on the metadata element, which raises
+        IndexError and kills the entire harvest. This wrapper catches
+        per-record errors so the rest of the batch continues.
+        """
+        while True:
+            try:
+                record = next(records)
+                yield record
+            except StopIteration:
+                break
+            except (IndexError, AttributeError) as e:
+                self.logger.warning(f"Skipping malformed OAI record: {e}")
+                continue
+            except Exception as e:
+                # Re-raise errors that aren't record-parsing issues
+                # (e.g. network errors, OAI protocol errors)
+                if 'list index out of range' in str(e):
+                    self.logger.warning(f"Skipping malformed OAI record: {e}")
+                    continue
+                raise
+
     def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
         from_date = first.strftime(self.date_format)
         until_date = last.strftime(self.date_format)
@@ -405,7 +432,7 @@ class EndpointHarvester:
             batch_counters = {}
             current_date_processing = None
 
-            for record in records:
+            for record in self._iter_records_safe(records):
                 self.metrics.increment_count()
                 self.metrics.update_datestamp(record.header.datestamp)
 
