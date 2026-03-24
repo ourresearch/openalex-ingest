@@ -122,11 +122,10 @@ def fetch_and_process_records(sickle, kwargs, record_type, upload_queue):
     return count
 
 
-def harvest_records(record_type, num_threads, update_mode=False):
+def harvest_records(num_threads, update_mode=False):
     if not DOAJ_API_KEY:
         raise RuntimeError("DOAJ_API_KEY environment variable is required")
-    base_url = "https://www.doaj.org/oai.article" if record_type == "articles" else "https://www.doaj.org/oai"
-    base_url += f"?api_key={DOAJ_API_KEY}"
+    base_url = f"https://www.doaj.org/oai.article?api_key={DOAJ_API_KEY}"
     sickle = Sickle(base_url)
 
     kwargs = {'metadataPrefix': 'oai_dc'}
@@ -134,7 +133,7 @@ def harvest_records(record_type, num_threads, update_mode=False):
         yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         kwargs['from'] = yesterday
         LOGGER.info(
-            f"Running in update mode. Fetching {record_type} updated since {yesterday}")
+            f"Running in update mode. Fetching articles updated since {yesterday}")
 
     upload_queue = Queue()
     workers = []
@@ -146,7 +145,7 @@ def harvest_records(record_type, num_threads, update_mode=False):
     count = 0
 
     try:
-        count = fetch_and_process_records(sickle, kwargs, record_type, upload_queue)
+        count = fetch_and_process_records(sickle, kwargs, "articles", upload_queue)
     finally:
         for _ in workers:
             upload_queue.put(None)
@@ -154,15 +153,13 @@ def harvest_records(record_type, num_threads, update_mode=False):
         for w in workers:
             w.join()
 
-        LOGGER.info(f"Completed. Total {record_type} processed: {count}")
+        LOGGER.info(f"Completed. Total articles processed: {count}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--threads', type=int, default=20)
     parser.add_argument('--update', action='store_true')
-    parser.add_argument('--type', choices=['articles', 'journals'],
-                        required=True)
     args = parser.parse_args()
 
-    harvest_records(args.type, args.threads, args.update)
+    harvest_records(args.threads, args.update)
