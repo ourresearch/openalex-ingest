@@ -725,6 +725,10 @@ class MySickle(Sickle):
                 if self.http_method == 'GET':
                     payload_str = "&".join(f"{k}={v}" for k, v in kwargs.items())
                     url = f"{self.endpoint}?{payload_str}"
+                    if "doaj.org" in self.endpoint:
+                        doaj_api_key = os.getenv("DOAJ_API_KEY")
+                        if doaj_api_key:
+                            url += f"&api_key={doaj_api_key}"
                     http_response = requests.get(url, headers=headers, **self.request_args)
                 else:
                     http_response = requests.post(self.endpoint, headers=headers, data=kwargs, **self.request_args)
@@ -787,12 +791,6 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=REQUEST_TIMEOUT):
     """Create a customized Sickle client for the given URL."""
     if not repo_pmh_url:
         return None
-
-    if "doaj.org" in repo_pmh_url:
-        doaj_api_key = os.getenv("DOAJ_API_KEY")
-        if doaj_api_key:
-            separator = "&" if "?" in repo_pmh_url else "?"
-            repo_pmh_url += f"{separator}api_key={doaj_api_key}"
 
     proxy_url = None
     if any(fragment in repo_pmh_url for fragment in ["citeseerx", "pure.coventry.ac.uk", "irdb.nii.ac.jp"]):
