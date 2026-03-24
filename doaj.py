@@ -12,7 +12,11 @@ import xml.etree.ElementTree as ET
 from tenacity import retry, retry_if_exception_type, wait_exponential, \
     stop_after_attempt
 
+import os
+
 from common import S3_BUCKET, LOGGER
+
+DOAJ_API_KEY = os.getenv('DOAJ_API_KEY')
 
 BATCH_SIZE = 1000
 
@@ -119,7 +123,10 @@ def fetch_and_process_records(sickle, kwargs, record_type, upload_queue):
 
 
 def harvest_records(record_type, num_threads, update_mode=False):
+    if not DOAJ_API_KEY:
+        raise RuntimeError("DOAJ_API_KEY environment variable is required")
     base_url = "https://www.doaj.org/oai.article" if record_type == "articles" else "https://www.doaj.org/oai"
+    base_url += f"?api_key={DOAJ_API_KEY}"
     sickle = Sickle(base_url)
 
     kwargs = {'metadataPrefix': 'oai_dc'}
