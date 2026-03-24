@@ -788,6 +788,12 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=REQUEST_TIMEOUT):
     if not repo_pmh_url:
         return None
 
+    if "doaj.org" in repo_pmh_url:
+        doaj_api_key = os.getenv("DOAJ_API_KEY")
+        if doaj_api_key:
+            separator = "&" if "?" in repo_pmh_url else "?"
+            repo_pmh_url += f"{separator}api_key={doaj_api_key}"
+
     proxy_url = None
     if any(fragment in repo_pmh_url for fragment in ["citeseerx", "pure.coventry.ac.uk", "irdb.nii.ac.jp"]):
         proxy_url = os.getenv("QUOTAGUARDSTATIC_URL") or os.getenv("STATIC_IP_PROXY")
