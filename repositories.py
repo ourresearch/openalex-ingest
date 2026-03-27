@@ -526,7 +526,10 @@ class EndpointHarvester:
 
             record_ids = sorted([r.header.identifier for r in records])
             content_hash = hashlib.md5("".join(record_ids).encode()).hexdigest()[:12]
-            object_key = f"repositories/{self.state.id}/{date_path}/{content_hash}.xml.gz"
+            if self.state.id == "irdb_nii_ac_jp":
+                object_key = f"irdb/{date_path}/{content_hash}.xml.gz"
+            else:
+                object_key = f"repositories/{self.state.id}/{date_path}/{content_hash}.xml.gz"
 
             try:
                 s3_client.head_object(Bucket=s3_bucket, Key=object_key)
