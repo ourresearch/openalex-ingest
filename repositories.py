@@ -47,6 +47,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import gc
 import gzip
 import hashlib
 import logging
@@ -460,7 +461,11 @@ class EndpointHarvester:
                     if current_date_processing in records_by_date and records_by_date[current_date_processing]:
                         self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
                                         records_by_date[current_date_processing], current_date_processing)
-                        records_by_date[current_date_processing] = []
+                    # Drop the finished date's entries entirely so the dicts
+                    # don't grow unbounded for endpoints walking through
+                    # years of historical dates.
+                    records_by_date.pop(current_date_processing, None)
+                    batch_counters.pop(current_date_processing, None)
 
                     checkpoint_dt = parse_datestamp(current_date_processing)
                     if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
@@ -903,70 +908,76 @@ def harvest_single_endpoint(
     logger = get_thread_logger()
     start_time = time()
 
-    # Apply per-host rate limiting
-    with host_rate_limiter.limit(pmh_url):
-        logger.info(f"Starting harvest for endpoint: {pmh_url}")
+    try:
+        # Apply per-host rate limiting
+        with host_rate_limiter.limit(pmh_url):
+            logger.info(f"Starting harvest for endpoint: {pmh_url}")
 
-        # Use context manager to ensure session is always closed
-        with Session() as session:
-            try:
-                # Load endpoint fresh within this thread's session
-                endpoint = StateManager.get_endpoint(endpoint_id, session)
-                if not endpoint:
-                    logger.error(f"Endpoint not found: {endpoint_id}")
-                    return (endpoint_id, 'connection_error', 0.0, "Endpoint not found")
-
-                harvester = EndpointHarvester(endpoint, session)
-                harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
-
-                response_time = time() - start_time
-                logger.info(f"Completed harvest for endpoint: {pmh_url} in {response_time:.2f}s")
-
-                # Update health status (using same session)
-                StateManager.update_health_status(
-                    endpoint, session,
-                    status='success',
-                    response_time=response_time
-                )
-
-                return (endpoint_id, 'success', response_time, None)
-
-            except NoRecordsMatch:
-                # No records is still a successful connection
-                response_time = time() - start_time
-                # Re-fetch endpoint if needed (in case it wasn't loaded due to early exception)
-                if 'endpoint' not in locals():
+            # Use context manager to ensure session is always closed
+            with Session() as session:
+                try:
+                    # Load endpoint fresh within this thread's session
                     endpoint = StateManager.get_endpoint(endpoint_id, session)
-                if endpoint:
+                    if not endpoint:
+                        logger.error(f"Endpoint not found: {endpoint_id}")
+                        return (endpoint_id, 'connection_error', 0.0, "Endpoint not found")
+
+                    harvester = EndpointHarvester(endpoint, session)
+                    harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
+
+                    response_time = time() - start_time
+                    logger.info(f"Completed harvest for endpoint: {pmh_url} in {response_time:.2f}s")
+
+                    # Update health status (using same session)
                     StateManager.update_health_status(
                         endpoint, session,
                         status='success',
                         response_time=response_time
                     )
-                return (endpoint_id, 'success', response_time, None)
 
-            except Exception as e:
-                response_time = time() - start_time
-                error_message = str(e)
-                status = classify_error(e)
+                    return (endpoint_id, 'success', response_time, None)
 
-                logger.error(f"Error harvesting endpoint {pmh_url}: {error_message}")
-
-                try:
-                    # Re-fetch endpoint if needed
+                except NoRecordsMatch:
+                    # No records is still a successful connection
+                    response_time = time() - start_time
+                    # Re-fetch endpoint if needed (in case it wasn't loaded due to early exception)
                     if 'endpoint' not in locals():
                         endpoint = StateManager.get_endpoint(endpoint_id, session)
                     if endpoint:
                         StateManager.update_health_status(
                             endpoint, session,
-                            status=status,
-                            response_time=response_time,
-                            error_message=error_message[:1000]  # Truncate long errors
+                            status='success',
+                            response_time=response_time
                         )
-                except Exception as db_error:
-                    logger.error(f"Failed to update health status: {db_error}")
+                    return (endpoint_id, 'success', response_time, None)
 
-                return (endpoint_id, status, response_time, error_message)
+                except Exception as e:
+                    response_time = time() - start_time
+                    error_message = str(e)
+                    status = classify_error(e)
+
+                    logger.error(f"Error harvesting endpoint {pmh_url}: {error_message}")
+
+                    try:
+                        # Re-fetch endpoint if needed
+                        if 'endpoint' not in locals():
+                            endpoint = StateManager.get_endpoint(endpoint_id, session)
+                        if endpoint:
+                            StateManager.update_health_status(
+                                endpoint, session,
+                                status=status,
+                                response_time=response_time,
+                                error_message=error_message[:1000]  # Truncate long errors
+                            )
+                    except Exception as db_error:
+                        logger.error(f"Failed to update health status: {db_error}")
+
+                    return (endpoint_id, status, response_time, error_message)
+    finally:
+        # Force cycle collection. lxml/ElementTree objects from the OAI parsing
+        # path have parent/child cycles that depend on Python's cycle collector;
+        # under heavy threading the collector lags and memory accumulates.
+        gc.collect()
 
 
 def harvest_single_endpoint_with_date_detection(
