@@ -83,7 +83,7 @@ from common import Base, LOGGER, S3_BUCKET, Session, db
 MAX_WORKERS = 100           # Total concurrent harvesting threads
 MAX_PER_HOST = 3            # Max concurrent requests to same host
 REQUEST_TIMEOUT = 15        # Seconds before giving up on a request
-BATCH_SIZE = 5000           # Records per S3 file
+BATCH_SIZE = 2000           # Records per S3 file
 
 
 # Shared boto3 S3 client. boto3 clients are thread-safe and expensive to
