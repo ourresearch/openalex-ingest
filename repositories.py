@@ -85,6 +85,22 @@ REQUEST_TIMEOUT = 15        # Seconds before giving up on a request
 BATCH_SIZE = 5000           # Records per S3 file
 
 
+# Shared boto3 S3 client. boto3 clients are thread-safe and expensive to
+# construct (event handlers, parsers, credential resolution), so we reuse
+# one across all endpoint harvests instead of allocating per-harvest.
+_s3_client_lock = threading.Lock()
+_s3_client = None
+
+
+def _get_shared_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        with _s3_client_lock:
+            if _s3_client is None:
+                _s3_client = boto3.client('s3')
+    return _s3_client
+
+
 # =============================================================================
 # DATABASE MODEL
 # =============================================================================
@@ -572,11 +588,7 @@ class EndpointHarvester:
 
     @contextmanager
     def _get_s3_client(self):
-        client = boto3.client('s3')
-        try:
-            yield client
-        finally:
-            pass
+        yield _get_shared_s3_client()
 
     def detect_date_format(self):
         """Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'."""
