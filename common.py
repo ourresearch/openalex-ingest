@@ -22,9 +22,9 @@ LOGGER = _make_logger()
 
 def get_database_url():
     """Convert postgres:// to postgresql:// if necessary"""
-    database_url = os.getenv('DATABASE_URL')
+    database_url = os.getenv('OPENALEX_SOURCES_DATABASE_URL')
     if not database_url:
-        raise ValueError("DATABASE_URL environment variable is not set")
+        raise ValueError("OPENALEX_SOURCES_DATABASE_URL environment variable is not set")
 
     parsed = urlparse(database_url)
     if parsed.scheme == 'postgres':
