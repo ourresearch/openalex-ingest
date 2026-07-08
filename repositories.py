@@ -812,10 +812,10 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=REQUEST_TIMEOUT):
     if not repo_pmh_url:
         return None
 
-    proxy_url = None
-    if any(fragment in repo_pmh_url for fragment in ["citeseerx", "pure.coventry.ac.uk", "irdb.nii.ac.jp"]):
-        proxy_url = os.getenv("QUOTAGUARDSTATIC_URL") or os.getenv("STATIC_IP_PROXY")
-
+    # Route all harvests through the QuotaGuard static IP so repositories see
+    # a consistent source address (previously only citeseerx, pure.coventry,
+    # and irdb.nii.ac.jp were proxied).
+    proxy_url = os.getenv("QUOTAGUARDSTATIC_URL") or os.getenv("STATIC_IP_PROXY")
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else {}
     iterator = OSTIItemIterator if 'osti.gov/oai' in repo_pmh_url else MyOAIItemIterator
     sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=iterator)
