@@ -24,9 +24,9 @@ def get_database_url():
     """Convert postgres:// to postgresql:// if necessary"""
     # SOURCES_DATABASE_URL is the openalex-sources app's database, attached as
     # a Heroku addon so credential rotations propagate automatically.
-    database_url = os.getenv('SOURCES_DATABASE_URL') or os.getenv('DATABASE_URL')
+    database_url = os.getenv('SOURCES_DATABASE_URL')
     if not database_url:
-        raise ValueError("Neither SOURCES_DATABASE_URL nor DATABASE_URL is set")
+        raise ValueError("SOURCES_DATABASE_URL environment variable is not set")
 
     parsed = urlparse(database_url)
     if parsed.scheme == 'postgres':
