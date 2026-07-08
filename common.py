@@ -22,9 +22,11 @@ LOGGER = _make_logger()
 
 def get_database_url():
     """Convert postgres:// to postgresql:// if necessary"""
-    database_url = os.getenv('OPENALEX_SOURCES_DATABASE_URL')
+    # SOURCES_DATABASE_URL is the openalex-sources app's database, attached as
+    # a Heroku addon so credential rotations propagate automatically.
+    database_url = os.getenv('SOURCES_DATABASE_URL') or os.getenv('DATABASE_URL')
     if not database_url:
-        raise ValueError("OPENALEX_SOURCES_DATABASE_URL environment variable is not set")
+        raise ValueError("Neither SOURCES_DATABASE_URL nor DATABASE_URL is set")
 
     parsed = urlparse(database_url)
     if parsed.scheme == 'postgres':
