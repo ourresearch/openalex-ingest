@@ -4,7 +4,8 @@ oxjob #737. Same fetch/land pattern as crossref.py `updates` mode, plus:
 - cursor checkpoint in S3 so a mid-run failure (or dyno death) resumes instead of restarting
 - progress logging against total-results
 
-Run:  heroku run:detached -a openalex-ingest -- python crossref_backfill_rw_20251231.py
+Run:  heroku run:detached -a openalex-ingest -- python crossref_backfill_rw_20251231.py [YYYY-MM-DD]
+(index date defaults to 2025-12-31)
 """
 import datetime
 import json
@@ -17,9 +18,10 @@ import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 S3_BUCKET = 'openalex-ingest'
-S3_PREFIX = 'crossref/updates/2025/12/31-rw-backfill'
-FILTER = 'from-index-date:2025-12-31,until-index-date:2025-12-31'
-CHECKPOINT_KEY = 'state/crossref_backfill_rw_20251231.checkpoint.json'
+INDEX_DATE = sys.argv[1] if len(sys.argv) > 1 else '2025-12-31'
+S3_PREFIX = f"crossref/updates/{INDEX_DATE.replace('-', '/')}-rw-backfill"
+FILTER = f'from-index-date:{INDEX_DATE},until-index-date:{INDEX_DATE}'
+CHECKPOINT_KEY = f"state/crossref_backfill_rw_{INDEX_DATE.replace('-', '')}.checkpoint.json"
 CROSSREF_API_KEY = os.getenv('CROSSREF_API_KEY')
 
 s3 = boto3.client('s3')
