@@ -68,7 +68,7 @@ from sickle.iterator import OAIItemIterator
 from sickle.models import ResumptionToken
 from sickle.oaiexceptions import NoRecordsMatch
 from sickle.response import OAIResponse
-from sqlalchemy import Column, Text, DateTime, Boolean, Interval, Float, select
+from sqlalchemy import BigInteger, Column, Text, DateTime, Boolean, Interval, Float, select
 import tenacity
 import xml.etree.ElementTree as ET
 
@@ -151,6 +151,7 @@ class Endpoint(Base):
     last_health_check = Column(DateTime)  # when we last tested
     last_response_time = Column(Float)    # seconds
     last_error_message = Column(Text)     # details if failed
+    last_record_count = Column(BigInteger)  # records retrieved in the attempt stamped by last_health_check (partial on failure); oxjob #804
 
     def __init__(self, **kwargs):
         super(self.__class__, self).__init__(**kwargs)
@@ -211,7 +212,8 @@ class StateManager:
         session,
         status: str,
         response_time: float,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        record_count: Optional[int] = None
     ):
         """
         Update endpoint health tracking columns after a harvest attempt.
@@ -223,11 +225,15 @@ class StateManager:
                    'malformed', 'oai_error'
             response_time: How long the request took in seconds
             error_message: Error details if status is not 'success'
+            record_count: Records retrieved from the feed in this attempt
+                   (0 for NoRecordsMatch; partial count on failure; None only
+                   when the harvester never got far enough to count). oxjob #804.
         """
         endpoint.last_health_status = status
         endpoint.last_health_check = datetime.now(timezone.utc)
         endpoint.last_response_time = response_time
         endpoint.last_error_message = error_message
+        endpoint.last_record_count = record_count
         session.merge(endpoint)
         session.commit()
 
@@ -932,7 +938,8 @@ def harvest_single_endpoint(
                     StateManager.update_health_status(
                         endpoint, session,
                         status='success',
-                        response_time=response_time
+                        response_time=response_time,
+                        record_count=harvester.metrics.record_count
                     )
 
                     return (endpoint_id, 'success', response_time, None)
@@ -947,7 +954,8 @@ def harvest_single_endpoint(
                         StateManager.update_health_status(
                             endpoint, session,
                             status='success',
-                            response_time=response_time
+                            response_time=response_time,
+                            record_count=0
                         )
                     return (endpoint_id, 'success', response_time, None)
 
@@ -967,7 +975,11 @@ def harvest_single_endpoint(
                                 endpoint, session,
                                 status=status,
                                 response_time=response_time,
-                                error_message=error_message[:1000]  # Truncate long errors
+                                error_message=error_message[:1000],  # Truncate long errors
+                                # Partial count retrieved before the error; None if
+                                # we failed before the harvester was constructed.
+                                record_count=(harvester.metrics.record_count
+                                              if 'harvester' in locals() else None)
                             )
                     except Exception as db_error:
                         logger.error(f"Failed to update health status: {db_error}")
