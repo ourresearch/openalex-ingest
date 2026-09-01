@@ -116,10 +116,10 @@ class Endpoint(Base):
     CURRENT HEALTH TRACKING:
       - last_health_status, last_health_check, last_response_time, last_error_message
     """
-    __tablename__ = "endpoint"
+    # oxjob #83.13 (Casey, 2026-09-01): registry table renamed from `endpoint`.
+    __tablename__ = "oai_pmh_endpoint"
 
     id = Column(Text, primary_key=True)
-    id_old = Column(Text)
     pmh_url = Column(Text)
     pmh_set = Column(Text)
     last_harvest_started = Column(DateTime)
@@ -128,12 +128,9 @@ class Endpoint(Base):
     earliest_timestamp = Column(DateTime)
     email = Column(Text)
     error = Column(Text)
-    repo_request_id = Column(Text)
     harvest_identify_response = Column(Text)
     harvest_test_recent_dates = Column(Text)
     sample_pmh_record = Column(Text)
-    contacted = Column(DateTime)
-    contacted_text = Column(Text)
     policy_promises_no_submitted = Column(Boolean)
     policy_promises_no_submitted_evidence = Column(Text)
     ready_to_run = Column(Boolean)
