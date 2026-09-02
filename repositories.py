@@ -420,8 +420,8 @@ class EndpointHarvester:
                 raise
 
     def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
-        from_date = first.strftime(self.date_format)
-        until_date = last.strftime(self.date_format)
+        from_date = format_oai_datestamp(first, self.date_format)
+        until_date = format_oai_datestamp(last, self.date_format)
 
         args = {
             'metadataPrefix': self.state.metadata_prefix,
@@ -657,7 +657,7 @@ class EndpointHarvester:
     def get_datetime_path(self, date_key):
         """Get the date path for S3 storage from a date string (YYYY-MM-DD)"""
         dt = parse_datestamp(date_key)
-        return f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
+        return f"{dt.year:04d}/{dt.month:02d}/{dt.day:02d}"
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(3),
@@ -839,6 +839,17 @@ def parse_date(date_str: str):
         return datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid date format: {date_str}. Use YYYY-MM-DD")
+
+
+def format_oai_datestamp(d, date_format):
+    """Format a from/until value. strftime('%Y') is not zero-padded on Linux for
+    years < 1000, and DSpace 7 endpoints advertise earliestDatestamp years like
+    0002; an unpadded 'from' fails their granularity check (oxjob #953)."""
+    ymd = f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+    if 'T' not in date_format:
+        return ymd
+    hms = d.strftime('%H:%M:%S') if isinstance(d, datetime) else '00:00:00'
+    return f"{ymd}T{hms}Z"
 
 
 def parse_datestamp(datestamp_str):
