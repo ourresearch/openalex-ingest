@@ -74,11 +74,12 @@ def get_crossref_data(filter_params, s3_bucket, s3_prefix):
             LOGGER.info(f"No more items to fetch on page {page_number}. Ending pagination.")
             has_more_pages = False
 
-        if 'next-cursor' not in data['message']:
+        # Crossref omits next-cursor on the final (empty) page.
+        cursor = data['message'].get('next-cursor')
+        if cursor is None:
             LOGGER.info("No next cursor found, pagination complete.")
             has_more_pages = False
 
-        cursor = data['message']['next-cursor']
         page_number += 1
 
         time.sleep(.5)
