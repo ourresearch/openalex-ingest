@@ -451,6 +451,7 @@ class EndpointHarvester:
             records_by_date = {}
             batch_counters = {}
             current_date_processing = None
+            records_saved = 0
 
             for record in self._iter_records_safe(records):
                 self.metrics.increment_count()
@@ -459,9 +460,18 @@ class EndpointHarvester:
                 datestamp = record.header.datestamp
                 date_key = datestamp.split('T')[0] if 'T' in datestamp else datestamp
 
-                # Checkpoint when date changes
-                if current_date_processing and date_key > current_date_processing:
+                # Checkpoint when date changes.
+                #
+                # This MUST fire on any change, not just an increase. A feed that returns
+                # records out of datestamp order (OpenEdition does: 2026-09-14, then 09-09,
+                # then 09-11 ...) leaves the bucket for every date we step *down* from open,
+                # and the final cleanup below used to write only the single date we happened
+                # to end on -- silently dropping 20% of a 113,872-record walk while still
+                # exiting 0 with "0 malformed, 0 OAI errors" (oxjob #1118, 2026-09-16).
+                # On an ordered feed dates only ever increase, so `!=` is a no-op there.
+                if current_date_processing and date_key != current_date_processing:
                     if current_date_processing in records_by_date and records_by_date[current_date_processing]:
+                        records_saved += len(records_by_date[current_date_processing])
                         self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
                                         records_by_date[current_date_processing], current_date_processing)
                     # Drop the finished date's entries entirely so the dicts
@@ -486,15 +496,33 @@ class EndpointHarvester:
                 records_by_date[date_key].append(record)
 
                 if len(records_by_date[date_key]) >= self.batch_size:
+                    records_saved += len(records_by_date[date_key])
                     self.save_batch(s3_client, s3_bucket, batch_counters[date_key],
                                     records_by_date[date_key], date_key)
                     records_by_date[date_key] = []
                     batch_counters[date_key] += 1
 
-            # Final cleanup
-            if current_date_processing and records_by_date.get(current_date_processing):
-                self.save_batch(s3_client, s3_bucket, batch_counters[current_date_processing],
-                                records_by_date[current_date_processing], current_date_processing)
+            # Final cleanup -- sweep EVERY bucket still open, not just the current date.
+            # The `!=` flush above should leave at most one, but an early break or a future
+            # change to the flush rule must not be able to resurrect the silent drop.
+            for leftover_date in sorted(records_by_date):
+                if records_by_date[leftover_date]:
+                    records_saved += len(records_by_date[leftover_date])
+                    self.save_batch(s3_client, s3_bucket,
+                                    batch_counters.get(leftover_date, 1),
+                                    records_by_date[leftover_date], leftover_date)
+
+            # Reconcile: record_count counts records ITERATED, which is what made the drop
+            # above invisible for as long as it existed. Compare against what we actually
+            # wrote, and against the feed's own completeListSize when it gave us one.
+            if records_saved != self.metrics.record_count:
+                self.logger.warning(
+                    f"Record loss: iterated {self.metrics.record_count}, saved {records_saved} "
+                    f"({self.metrics.record_count - records_saved} unsaved) for {self.state.pmh_url}")
+            if self.metrics.total_records and records_saved < self.metrics.total_records:
+                self.logger.warning(
+                    f"Short harvest: feed advertised {self.metrics.total_records}, "
+                    f"saved {records_saved} for {self.state.pmh_url}")
 
             if current_date_processing:
                 checkpoint_dt = parse_datestamp(current_date_processing)
