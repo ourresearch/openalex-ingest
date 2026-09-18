@@ -5,7 +5,7 @@ This module harvests metadata records from OAI-PMH repository endpoints
 and saves them to S3 for processing by the OpenAlex pipeline.
 
 SIMPLIFIED ARCHITECTURE (January 2026):
-The harvester runs a single daily job that harvests ALL ~6,000 endpoints
+The harvester runs a single daily job that harvests ALL ~5,000 endpoints
 in parallel (~15 minutes total). This replaced a complex 4-tier system
 that scheduled endpoints separately based on reliability.
 
@@ -39,7 +39,7 @@ PARALLELIZATION:
 - Uses ThreadPoolExecutor with 100 concurrent workers
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
 - 15-second timeout per request
-- Total runtime: ~15 minutes for all ~6,000 endpoints
+- Total runtime: ~15 minutes for all ~5,000 endpoints
 """
 
 import argparse

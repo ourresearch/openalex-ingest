@@ -6,7 +6,7 @@ Please send all bug reports and feature requests to support@openalex.org.
 
 ## Repository Harvester
 
-The repository harvester (`repositories.py`) pulls metadata from ~6,000 OAI-PMH endpoints daily and saves records to S3 for processing by the OpenAlex pipeline.
+The repository harvester (`repositories.py`) pulls metadata from ~5,000 OAI-PMH endpoints daily and saves records to S3 for processing by the OpenAlex pipeline.
 
 ### Architecture (Simplified January 2026)
 
@@ -15,7 +15,7 @@ The harvester uses a simple, massively parallel approach:
 1. **Daily Job**: One scheduled job harvests ALL endpoints
 2. **Parallelization**: 100 concurrent threads with per-host rate limiting (max 3 per host)
 3. **Health Tracking**: Each endpoint's status is recorded after every harvest attempt
-4. **Runtime**: ~15 minutes for all ~6,000 endpoints
+4. **Runtime**: ~15 minutes for all ~5,000 endpoints
 
 This replaced a complex 4-tier system that scheduled endpoints separately based on "reliability" tiers. The old system was:
 - Overly complex with 4 separate scheduled jobs
