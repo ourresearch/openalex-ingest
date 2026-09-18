@@ -768,7 +768,7 @@ class MySickle(Sickle):
         self.metrics_logger = metrics_logger
 
     def harvest(self, **kwargs):
-        headers = {'User-Agent': 'OAIHarvester/1.0'}
+        headers = {'User-Agent': 'OpenAlexHarvester/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
         retry_wait = self.DEFAULT_RETRY_SECONDS
 
         for attempt in range(self.max_retries):
