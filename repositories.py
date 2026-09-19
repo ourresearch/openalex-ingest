@@ -576,8 +576,18 @@ class EndpointHarvester:
         try:
             date_path = self.get_datetime_path(date_key)
 
+            # oxjob #1118: hash the record bodies as well as their identifiers. Keying on
+            # identifiers alone made a re-harvest a no-op whenever a provider rewrote a
+            # record's content without moving its datestamp -- the key matched, head_object
+            # skipped, and the correction never landed. Cairn has been doing that for years
+            # (DOIs, live URLs and access rights all added under frozen 2021 datestamps).
+            # Identical content still skips; changed content now lands at a new key, which
+            # is what Auto Loader needs to see it (overwriting a path does not re-trigger it).
             record_ids = sorted([r.header.identifier for r in records])
-            content_hash = hashlib.md5("".join(record_ids).encode()).hexdigest()[:12]
+            record_bodies = sorted(str(r.raw) for r in records)
+            content_hash = hashlib.md5(
+                ("".join(record_ids) + "".join(record_bodies)).encode()
+            ).hexdigest()[:12]
             if self.state.id == "irdb_nii_ac_jp":
                 object_key = f"irdb/{date_path}/{content_hash}.xml.gz"
             else:
