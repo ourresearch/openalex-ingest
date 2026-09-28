@@ -30,7 +30,10 @@ CURRENT HEALTH TRACKING:
 The harvester now uses these columns to track endpoint health:
 
   - last_health_status: Current status from most recent harvest attempt
-    Values: 'success', 'blocked', 'timeout', 'connection_error', 'malformed', 'oai_error'
+    Values: 'success', 'empty', 'first_harvest_timeout', 'blocked', 'timeout', 'connection_error',
+    'malformed', 'oai_error' ('empty' = a first harvest, no checkpoint and no 'from', that
+    returned 0 records; 'first_harvest_timeout' = a first harvest stopped at
+    FIRST_HARVEST_DEADLINE_SECONDS with no checkpoint written)
   - last_health_check: Timestamp of last harvest attempt
   - last_response_time: Response time in seconds
   - last_error_message: Error details if harvest failed
@@ -84,6 +87,21 @@ MAX_WORKERS = 100           # Total concurrent harvesting threads
 MAX_PER_HOST = 3            # Max concurrent requests to same host
 REQUEST_TIMEOUT = 15        # Seconds before giving up on a request
 BATCH_SIZE = 5000           # Records per S3 file
+EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
+# Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
+# (100 threads) finished all ~4,600 endpoints in 2h09m on 2026-09-28 and its slowest endpoint took
+# 90 min; 6h lets a large new feed finish in one run while keeping a runaway walk from holding a
+# worker thread and the dyno for most of the day. Checked after each record and by MySickle before
+# every HTTP attempt and retry sleep, so the overrun is at most the one HTTP attempt already in
+# flight (plus a <=10s tenacity backoff). Explicit --start-date runs checkpoint as they go and have
+# no cap.
+FIRST_HARVEST_DEADLINE_SECONDS = 6 * 3600
+# Upper bound on a server-sent Retry-After (503/429); it was honoured uncapped.
+MAX_RETRY_AFTER_SECONDS = 300
+
+
+class FirstHarvestDeadline(Exception):
+    """A first harvest hit FIRST_HARVEST_DEADLINE_SECONDS; recorded as 'first_harvest_timeout'."""
 
 
 # Shared boto3 S3 client. boto3 clients are thread-safe and expensive to
@@ -144,7 +162,7 @@ class Endpoint(Base):
     is_core = Column(Boolean)           # LEGACY: was for tiering priority
 
     # CURRENT HEALTH TRACKING COLUMNS
-    last_health_status = Column(Text)     # success, blocked, timeout, connection_error, malformed, oai_error
+    last_health_status = Column(Text)     # success, empty, first_harvest_timeout, blocked, timeout, connection_error, malformed, oai_error
     last_health_check = Column(DateTime)  # when we last tested
     last_response_time = Column(Float)    # seconds
     last_error_message = Column(Text)     # details if failed
@@ -218,8 +236,10 @@ class StateManager:
         Args:
             endpoint: The endpoint to update
             session: Database session
-            status: One of 'success', 'blocked', 'timeout', 'connection_error',
-                   'malformed', 'oai_error'
+            status: One of 'success', 'empty', 'first_harvest_timeout', 'blocked',
+                   'timeout', 'connection_error', 'malformed', 'oai_error'. 'empty' =
+                   a first harvest (no checkpoint) that got 0 records;
+                   'first_harvest_timeout' = a first harvest that hit its deadline.
             response_time: How long the request took in seconds
             error_message: Error details if status is not 'success'
             record_count: Records retrieved from the feed in this attempt
@@ -370,9 +390,9 @@ class EndpointHarvester:
         """
         Harvest records from the endpoint over the given date range.
         Assumes that first and last are already bounded (e.g., 1–5 days),
-        and does NOT update any state.
+        and does NOT update any state. first=None means a first harvest:
+        no 'from' is sent, so the feed returns everything up to last.
         """
-        first = first or datetime(2000, 1, 1).date()
         if isinstance(first, datetime):
             first = first.date()
         if isinstance(last, datetime):
@@ -420,14 +440,29 @@ class EndpointHarvester:
                 raise
 
     def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
-        from_date = format_oai_datestamp(first, self.date_format)
         until_date = format_oai_datestamp(last, self.date_format)
 
         args = {
             'metadataPrefix': self.state.metadata_prefix,
-            'from': from_date,
             'until': until_date
         }
+
+        # No 'from' on a first harvest. Identify's earliestDatestamp is not a safe
+        # lower bound: figshare advertises 1800-01-01 and answers noRecordsMatch for
+        # it; DSpace 7 advertises its last reindex time, so the window starts after
+        # every record it has. Both left new endpoints at 0 records forever.
+        #
+        # A first harvest walks the whole feed, and feeds are not always in datestamp
+        # order (figshare is newest-first). A mid-walk checkpoint would then land near
+        # the newest date and a failed run would skip everything older on the next day.
+        # So a first harvest persists no checkpoint until the walk completes, and then
+        # writes the max datestamp it saw. A failed first harvest restarts from scratch.
+        first_harvest = first is None
+        max_date_key = None
+        min_date_key = None
+        deadline = time() + FIRST_HARVEST_DEADLINE_SECONDS if first_harvest else None
+        if not first_harvest:
+            args['from'] = format_oai_datestamp(first, self.date_format)
 
         if self.state.pmh_set:
             args["set"] = self.state.pmh_set
@@ -436,6 +471,7 @@ class EndpointHarvester:
 
         try:
             my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics)
+            my_sickle.deadline = deadline  # MySickle stops retrying/sleeping past it
             records = self._make_oai_request(my_sickle, **args)
 
             if hasattr(records._items, 'oai_response'):
@@ -459,6 +495,10 @@ class EndpointHarvester:
 
                 datestamp = record.header.datestamp
                 date_key = datestamp.split('T')[0] if 'T' in datestamp else datestamp
+                if max_date_key is None or date_key > max_date_key:
+                    max_date_key = date_key
+                if min_date_key is None or date_key < min_date_key:
+                    min_date_key = date_key
 
                 # Checkpoint when date changes.
                 #
@@ -481,7 +521,7 @@ class EndpointHarvester:
                     batch_counters.pop(current_date_processing, None)
 
                     checkpoint_dt = parse_datestamp(current_date_processing)
-                    if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
+                    if not first_harvest and (not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested):
                         self.state.most_recent_date_harvested = checkpoint_dt
                         self.db.merge(self.state)
                         self.db.commit()
@@ -501,6 +541,12 @@ class EndpointHarvester:
                                     records_by_date[date_key], date_key)
                     records_by_date[date_key] = []
                     batch_counters[date_key] += 1
+
+                # Checked after the record is buffered, so it is counted and saved. Raised inside
+                # the try: the except below saves the open bucket to S3, and first_harvest keeps
+                # it from writing a checkpoint.
+                if deadline is not None and time() > deadline:
+                    raise FirstHarvestDeadline("deadline reached between records")
 
             # Final cleanup -- sweep EVERY bucket still open, not just the current date.
             # The `!=` flush above should leave at most one, but an early break or a future
@@ -524,13 +570,15 @@ class EndpointHarvester:
                     f"Short harvest: feed advertised {self.metrics.total_records}, "
                     f"saved {records_saved} for {self.state.pmh_url}")
 
-            if current_date_processing:
-                checkpoint_dt = parse_datestamp(current_date_processing)
+            # First harvest: the walk completed, so the max datestamp seen is safe.
+            final_date = max_date_key if first_harvest else current_date_processing
+            if final_date:
+                checkpoint_dt = parse_datestamp(final_date)
                 if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
                     self.state.most_recent_date_harvested = checkpoint_dt
                     self.db.merge(self.state)
                     self.db.commit()
-                    self.logger.info(f"Checkpoint: {current_date_processing} complete (final)")
+                    self.logger.info(f"Checkpoint: {final_date} complete (final)")
 
         except NoRecordsMatch:
             self.logger.info(f"No records found for {self.state.pmh_url} with args {args}")
@@ -550,9 +598,10 @@ class EndpointHarvester:
                         self.logger.info(f"Saved partial batch for {current_date_processing} before error")
 
                     # Update checkpoint to last completed date (one before current)
-                    # We don't checkpoint the current date since it may be incomplete
+                    # We don't checkpoint the current date since it may be incomplete.
+                    # Never on a first harvest: its walk order is unknown (see above).
                     checkpoint_dt = parse_datestamp(current_date_processing) - timedelta(days=1)
-                    if checkpoint_dt > datetime(2000, 1, 1):
+                    if not first_harvest and checkpoint_dt > datetime(2000, 1, 1):
                         if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
                             self.state.most_recent_date_harvested = checkpoint_dt
                             self.db.merge(self.state)
@@ -561,6 +610,12 @@ class EndpointHarvester:
             except Exception as save_error:
                 self.logger.warning(f"Failed to save partial progress: {save_error}")
 
+            if isinstance(e, FirstHarvestDeadline):
+                raise FirstHarvestDeadline(
+                    f"First harvest stopped at the {FIRST_HARVEST_DEADLINE_SECONDS // 3600}h deadline ({e}) after "
+                    f"{self.metrics.record_count} records (datestamps {min_date_key} to {max_date_key}); "
+                    f"no checkpoint written. Recover by hand with an explicit window, which checkpoints "
+                    f"as it goes: python repositories.py --endpoint-id {self.state.id} --start-date YYYY-MM-DD") from e
             raise
 
     @tenacity.retry(
@@ -765,6 +820,7 @@ class MySickle(Sickle):
 
     def __init__(self, *args, **kwargs):
         self.metrics_logger = None
+        self.deadline = None  # epoch seconds; set by call_pmh_endpoint for first harvests
         self.http_method = kwargs.get('http_method', 'GET')
         kwargs['max_retries'] = kwargs.get('max_retries', 3)
         if 'osti.gov/oai' in args[0]:
@@ -777,11 +833,24 @@ class MySickle(Sickle):
     def set_metrics_logger(self, metrics_logger):
         self.metrics_logger = metrics_logger
 
+    def _check_deadline(self, wait=0):
+        """Stop instead of starting a request or a sleep that would end past the deadline."""
+        if self.deadline is not None and time() + wait > self.deadline:
+            raise FirstHarvestDeadline("deadline reached during OAI request retries")
+
+    @staticmethod
+    def _retry_after(value, fallback):
+        try:
+            return min(max(int(value), 0), MAX_RETRY_AFTER_SECONDS)
+        except (TypeError, ValueError):
+            return fallback
+
     def harvest(self, **kwargs):
         headers = {'User-Agent': 'OpenAlexHarvester/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
         retry_wait = self.DEFAULT_RETRY_SECONDS
 
         for attempt in range(self.max_retries):
+            self._check_deadline()
             try:
                 if self.http_method == 'GET':
                     payload_str = "&".join(f"{k}={v}" for k, v in kwargs.items())
@@ -805,23 +874,22 @@ class MySickle(Sickle):
                 elif http_response.status_code == 503:
                     retry_after = http_response.headers.get('Retry-After')
                     if retry_after:
-                        retry_wait = int(retry_after)
+                        retry_wait = self._retry_after(retry_after, self.DEFAULT_RETRY_SECONDS)
                     else:
                         retry_wait = min(retry_wait * 2, 60)
                     self.logger.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
+                    self._check_deadline(retry_wait)
                     sleep(retry_wait)
                     continue
                 elif http_response.status_code == 429:
                     retry_after = http_response.headers.get('Retry-After')
                     if retry_after:
-                        try:
-                            retry_wait = int(retry_after)
-                        except ValueError:
-                            retry_wait = self.DEFAULT_RETRY_SECONDS
+                        retry_wait = self._retry_after(retry_after, self.DEFAULT_RETRY_SECONDS)
                     else:
                         retry_wait = min(retry_wait * 2, 60)
 
                     self.logger.warning(f"HTTP 429 Too Many Requests. Retrying after {retry_wait} seconds...")
+                    self._check_deadline(retry_wait)
                     sleep(retry_wait)
                     continue
 
@@ -838,11 +906,14 @@ class MySickle(Sickle):
 
                 return OAIResponse(http_response, params=kwargs)
 
+            except FirstHarvestDeadline:
+                raise
             except Exception as e:
                 LOGGER.error(f"Error harvesting from {self.endpoint}: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise
                 self.logger.info(f"Retrying after {retry_wait} seconds due to error...")
+                self._check_deadline(retry_wait)
                 sleep(retry_wait)
 
         raise Exception(f"Failed to harvest after {self.max_retries} retries")
@@ -906,12 +977,15 @@ def classify_error(error: Exception) -> str:
     """
     Classify an exception into a health status category.
 
-    Returns one of: 'timeout', 'connection_error', 'blocked', 'malformed', 'oai_error'
+    Returns one of: 'first_harvest_timeout', 'timeout', 'connection_error', 'blocked',
+    'malformed', 'oai_error'
     """
     error_str = str(error).lower()
     error_type = type(error).__name__
 
-    if isinstance(error, requests.exceptions.Timeout):
+    if isinstance(error, FirstHarvestDeadline):
+        return 'first_harvest_timeout'
+    elif isinstance(error, requests.exceptions.Timeout):
         return 'timeout'
     elif isinstance(error, requests.exceptions.ConnectionError):
         return 'connection_error'
@@ -978,32 +1052,45 @@ def harvest_single_endpoint(
                     harvester.harvest(s3_bucket=s3_bucket, first=start_date, last=end_date)
 
                     response_time = time() - start_time
-                    logger.info(f"Completed harvest for endpoint: {pmh_url} in {response_time:.2f}s")
+                    logger.info(f"Completed {'first ' if start_date is None else ''}harvest for endpoint: {pmh_url}: "
+                                f"{harvester.metrics.record_count} records in {response_time:.2f}s")
+
+                    # A first harvest (no checkpoint, no from) that finds nothing is
+                    # not a success: the feed is empty or broken for us, and 'success'
+                    # hid it. call_pmh_endpoint swallows NoRecordsMatch, so check the count.
+                    status, error_message = 'success', None
+                    if start_date is None and harvester.metrics.record_count == 0:
+                        status = 'empty'
+                        error_message = EMPTY_FIRST_HARVEST_MSG
 
                     # Update health status (using same session)
                     StateManager.update_health_status(
                         endpoint, session,
-                        status='success',
+                        status=status,
                         response_time=response_time,
+                        error_message=error_message,
                         record_count=harvester.metrics.record_count
                     )
 
-                    return (endpoint_id, 'success', response_time, None)
+                    return (endpoint_id, status, response_time, error_message)
 
                 except NoRecordsMatch:
-                    # No records is still a successful connection
+                    # No records is still a successful connection (unless first harvest)
                     response_time = time() - start_time
+                    status = 'empty' if start_date is None else 'success'
+                    error_message = EMPTY_FIRST_HARVEST_MSG if status == 'empty' else None
                     # Re-fetch endpoint if needed (in case it wasn't loaded due to early exception)
                     if 'endpoint' not in locals():
                         endpoint = StateManager.get_endpoint(endpoint_id, session)
                     if endpoint:
                         StateManager.update_health_status(
                             endpoint, session,
-                            status='success',
+                            status=status,
                             response_time=response_time,
+                            error_message=error_message,
                             record_count=0
                         )
-                    return (endpoint_id, 'success', response_time, None)
+                    return (endpoint_id, status, response_time, error_message)
 
                 except Exception as e:
                     response_time = time() - start_time
@@ -1046,38 +1133,20 @@ def harvest_single_endpoint_with_date_detection(
     end_date
 ) -> Tuple[str, str, float, Optional[str]]:
     """
-    Harvest a single endpoint, detecting earliest datestamp if start_date is None.
-
-    This is used when --start-date is not provided and the endpoint has never been
-    harvested before. The earliest datestamp detection happens inside the thread
-    to avoid blocking the main thread.
+    Harvest a single endpoint. start_date is None when --start-date is not provided
+    and the endpoint has never been checkpointed; it is passed through as None so
+    the first harvest sends no 'from' (see call_pmh_endpoint).
 
     Args:
         endpoint_id: The endpoint ID to harvest
         pmh_url: The PMH URL for rate limiting
         s3_bucket: S3 bucket for storing records
-        start_date: Start date for harvesting, or None to detect earliest datestamp
+        start_date: Start date for harvesting, or None for a first harvest (no 'from')
         end_date: End date for harvesting
 
     Returns:
         Tuple of (endpoint_id, status, response_time, error_message)
     """
-    logger = get_thread_logger()
-
-    if start_date is None:
-        # Detect earliest datestamp for new endpoints
-        try:
-            with Session() as session:
-                endpoint = StateManager.get_endpoint(endpoint_id, session)
-                if endpoint:
-                    harvester = EndpointHarvester(endpoint, session)
-                    start_date = harvester.get_earliest_datestamp().date()
-                else:
-                    start_date = datetime(2000, 1, 1).date()
-        except Exception as e:
-            logger.warning(f"Failed to get earliest datestamp for {pmh_url}: {e}")
-            start_date = datetime(2000, 1, 1).date()
-
     return harvest_single_endpoint(endpoint_id, pmh_url, s3_bucket, start_date, end_date)
 
 
@@ -1257,8 +1326,7 @@ Examples:
                 if most_recent:
                     first_date = most_recent.date() - timedelta(days=1)
                 else:
-                    # For new endpoints, we'll compute earliest datestamp inside the thread
-                    # to avoid blocking the main thread. Pass None and handle in worker.
+                    # Never checkpointed: first harvest, no 'from' (see call_pmh_endpoint)
                     first_date = None
 
                 future = executor.submit(
@@ -1274,6 +1342,8 @@ Examples:
             stats = {
                 'total': len(endpoint_data),
                 'success': 0,
+                'empty': 0,
+                'first_harvest_timeout': 0,
                 'blocked': 0,
                 'timeout': 0,
                 'connection_error': 0,

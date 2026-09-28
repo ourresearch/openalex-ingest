@@ -41,7 +41,7 @@ The harvester tracks endpoint health with these database columns:
 
 | Column | Description |
 |--------|-------------|
-| `last_health_status` | Status from last attempt: `success`, `blocked`, `timeout`, `connection_error`, `malformed`, `oai_error` |
+| `last_health_status` | Status from last attempt: `success`, `empty` (first harvest got 0 records), `first_harvest_timeout` (first harvest hit its 6h cap, no checkpoint), `blocked`, `timeout`, `connection_error`, `malformed`, `oai_error` |
 | `last_health_check` | Timestamp of last harvest attempt |
 | `last_response_time` | Response time in seconds |
 | `last_error_message` | Error details if harvest failed |
