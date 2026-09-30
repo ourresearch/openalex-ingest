@@ -41,7 +41,7 @@ The harvester now uses these columns to track endpoint health:
 PARALLELIZATION:
 - Uses ThreadPoolExecutor with 100 concurrent workers
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
-- 15-second timeout per request
+- 15-second connect / 60-second read timeout per request (oxjob #1425 H2)
 - Total runtime: ~15 minutes for all ~5,000 endpoints
 """
 
@@ -65,6 +65,11 @@ from botocore.exceptions import BotoCoreError, ClientError
 import defusedxml.ElementTree as DefusedET
 from defusedxml.ElementTree import ParseError
 import requests
+from requests.adapters import HTTPAdapter
+import ssl
+import certifi
+from cryptography import x509
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
 import shortuuid
 from sickle import Sickle, oaiexceptions
 from sickle.iterator import OAIItemIterator
@@ -85,7 +90,11 @@ from common import Base, LOGGER, S3_BUCKET, Session, db
 # Parallelization settings
 MAX_WORKERS = 100           # Total concurrent harvesting threads
 MAX_PER_HOST = 3            # Max concurrent requests to same host
-REQUEST_TIMEOUT = 15        # Seconds before giving up on a request
+REQUEST_TIMEOUT = 15        # Connect timeout (seconds)
+# Read timeout (seconds). Small OJS installs routinely take 20-30 s to render a ListRecords
+# page; at 15 s they failed every night while dead hosts still fail fast on connect
+# (oxjob #1425 H2: 9 OJS feeds, 13K held records, plus 3 new #1417 feeds).
+READ_TIMEOUT = 60
 BATCH_SIZE = 5000           # Records per S3 file
 EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
 # Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
@@ -694,7 +703,7 @@ class EndpointHarvester:
     def detect_date_format(self):
         """Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'."""
         try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=(10, READ_TIMEOUT))
             identify = my_sickle.Identify()
             earliest = identify.earliestDatestamp
 
@@ -726,7 +735,7 @@ class EndpointHarvester:
             return datetime(2000, 1, 1)
 
         try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=10)
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=(10, READ_TIMEOUT))
             identify = my_sickle.Identify()
             earliest = identify.earliestDatestamp
 
@@ -756,6 +765,10 @@ class EndpointHarvester:
         stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
         retry=tenacity.retry_if_exception_type(requests.exceptions.RequestException),
+        # Re-raise the last real exception, not tenacity.RetryError: classify_error and
+        # last_error_message need the HTTP status (oxjob #1425 H1: 159 OJS rows read
+        # "RetryError[... HTTPError]" and every 403 WAF block was filed as connection_error).
+        reraise=True,
         before=tenacity.before_log(LOGGER, logging.INFO),
         after=tenacity.after_log(LOGGER, logging.INFO)
     )
@@ -862,9 +875,9 @@ class MySickle(Sickle):
                         doaj_api_key = os.getenv("DOAJ_API_KEY")
                         if doaj_api_key:
                             url += f"&api_key={doaj_api_key}"
-                    http_response = requests.get(url, headers=headers, **self.request_args)
+                    http_response = _tls_tolerant_request('get', url, headers=headers, **self.request_args)
                 else:
-                    http_response = requests.post(self.endpoint, headers=headers, data=kwargs, **self.request_args)
+                    http_response = _tls_tolerant_request('post', self.endpoint, headers=headers, data=kwargs, **self.request_args)
 
                 if self.metrics_logger:
                     self.metrics_logger.update_url(http_response.url)
@@ -922,7 +935,101 @@ class MySickle(Sickle):
         raise Exception(f"Failed to harvest after {self.max_retries} retries")
 
 
-def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=REQUEST_TIMEOUT):
+# =============================================================================
+# TLS COMPATIBILITY FALLBACK (oxjob #1425 H3)
+# =============================================================================
+# Two failures the dyno's OpenSSL 3 rejects while browsers (and macOS) connect fine:
+#   1. the server sends only its leaf certificate, without the intermediate
+#      ("unable to get local issuer certificate"; e.g. ojs.unesp.br, polilog.pl,
+#      www.journals.ufrpe.br): browsers fetch the intermediate from the leaf's AIA
+#      caIssuers URL, so we do the same;
+#   2. the server only speaks legacy TLS options (SSLV3_ALERT_HANDSHAKE_FAILURE /
+#      UNSAFE_LEGACY_RENEGOTIATION; e.g. cendie.abc.gob.ar): allow legacy renegotiation and
+#      SECLEVEL=1 ciphers.
+# The fallback runs only after a normal verified request raised SSLError, verification stays
+# on (only the chain is completed), and one context per host is cached.
+
+_OP_LEGACY_SERVER_CONNECT = getattr(ssl, 'OP_LEGACY_SERVER_CONNECT', 0x4)
+_tls_fallback_sessions = {}
+_tls_fallback_lock = threading.Lock()
+
+
+class _ContextAdapter(HTTPAdapter):
+    def __init__(self, ssl_context, **kwargs):
+        self._ssl_context = ssl_context
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['ssl_context'] = self._ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs['ssl_context'] = self._ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
+def _aia_intermediates_pem(host, port=443, max_depth=3):
+    """Follow AIA caIssuers from the server's leaf certificate; return PEM intermediates."""
+    pems = []
+    try:
+        der = ssl.PEM_cert_to_DER_cert(ssl.get_server_certificate((host, port), timeout=15))
+    except Exception as e:
+        LOGGER.info(f"TLS fallback: could not read leaf certificate of {host}: {e}")
+        return pems
+    for _ in range(max_depth):
+        cert = x509.load_der_x509_certificate(der)
+        if cert.issuer == cert.subject:
+            break
+        try:
+            aia = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+        except x509.ExtensionNotFound:
+            break
+        urls = [d.access_location.value for d in aia
+                if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+        if not urls:
+            break
+        try:
+            der = requests.get(urls[0], timeout=15).content
+            issuer = x509.load_der_x509_certificate(der)
+        except Exception as e:
+            LOGGER.info(f"TLS fallback: could not fetch issuer {urls[0]} for {host}: {e}")
+            break
+        if issuer.issuer == issuer.subject:
+            break  # reached a root; roots come from certifi, never from AIA
+        pems.append(ssl.DER_cert_to_PEM_cert(der))
+    return pems
+
+
+def _tls_fallback_session(url):
+    host = urlparse(url).hostname
+    with _tls_fallback_lock:
+        if host in _tls_fallback_sessions:
+            return _tls_fallback_sessions[host]
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    ctx.options |= _OP_LEGACY_SERVER_CONNECT
+    ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+    for pem in _aia_intermediates_pem(host):
+        ctx.load_verify_locations(cadata=pem)
+    session = requests.Session()
+    adapter = _ContextAdapter(ctx)
+    session.mount('https://', adapter)
+    with _tls_fallback_lock:
+        _tls_fallback_sessions.setdefault(host, session)
+        return _tls_fallback_sessions[host]
+
+
+def _tls_tolerant_request(method, url, **kwargs):
+    """requests.get/post; on SSLError retry once through a per-host compatibility session."""
+    try:
+        return getattr(requests, method)(url, **kwargs)
+    except requests.exceptions.SSLError as e:
+        # also covers an http URL redirected to an https host with a broken chain: the
+        # fallback session follows the redirect with its https adapter
+        LOGGER.info(f"TLS fallback for {urlparse(url).hostname}: {str(e)[:160]}")
+        return getattr(_tls_fallback_session(url), method)(url, **kwargs)
+
+
+def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=(REQUEST_TIMEOUT, READ_TIMEOUT)):
     """Create a customized Sickle client for the given URL."""
     if not repo_pmh_url:
         return None
@@ -983,8 +1090,11 @@ def classify_error(error: Exception) -> str:
     Returns one of: 'first_harvest_timeout', 'timeout', 'connection_error', 'blocked',
     'malformed', 'oai_error'
     """
+    if isinstance(error, tenacity.RetryError) and error.last_attempt.failed:
+        error = error.last_attempt.exception()
     error_str = str(error).lower()
     error_type = type(error).__name__
+    status_code = getattr(getattr(error, 'response', None), 'status_code', None)
 
     if isinstance(error, FirstHarvestDeadline):
         return 'first_harvest_timeout'
@@ -993,7 +1103,7 @@ def classify_error(error: Exception) -> str:
     elif isinstance(error, requests.exceptions.ConnectionError):
         return 'connection_error'
     elif isinstance(error, requests.exceptions.HTTPError):
-        if '403' in error_str or '401' in error_str:
+        if status_code in (401, 403, 429) or '403' in error_str or '401' in error_str:
             return 'blocked'
         return 'connection_error'
     elif 'timeout' in error_str:
