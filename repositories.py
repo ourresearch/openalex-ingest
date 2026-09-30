@@ -55,6 +55,7 @@ import gzip
 import hashlib
 import logging
 import os
+import re
 import threading
 from time import sleep, time
 from typing import Optional, List, Tuple
@@ -861,6 +862,32 @@ class MySickle(Sickle):
         except (TypeError, ValueError):
             return fallback
 
+    # oxjob #1418: some OJS installs print PHP notices as HTML *before* the XML declaration, e.g. Maestro y
+    # Sociedad (OJS 3.3.0.15): "Array to string conversion in PKPString.inc.php" once per array-valued subtitle,
+    # 381 records. The document after them is intact. Drop the prefix, but only when it consists entirely of
+    # PHP's display_errors blocks and the XML declaration follows; any other junk still fails as before.
+    _PHP_NOTICE_BLOCK = re.compile(
+        rb'\s*<br\s*/?>\s*<b>(?:Notice|Warning|Deprecated|Strict Standards)</b>:[^<]{0,1000}'
+        rb'(?:<b>[^<]{0,500}</b>[^<]{0,100}){0,2}<br\s*/?>',
+        re.IGNORECASE)
+
+    def _strip_php_notice_prefix(self, http_response):
+        content = http_response.content
+        start = content.find(b'<?xml')
+        if start <= 0 or not content[:20].lstrip().lower().startswith(b'<br'):
+            return
+        prefix = content[:start]
+        pos, blocks = 0, 0
+        while pos < len(prefix):
+            m = self._PHP_NOTICE_BLOCK.match(prefix, pos)
+            if not m:
+                break
+            pos, blocks = m.end(), blocks + 1
+        if blocks == 0 or prefix[pos:].strip():
+            return
+        http_response._content = content[start:]
+        LOGGER.warning(f"Stripped {blocks} PHP notice(s) before the XML declaration from {self.endpoint}")
+
     def harvest(self, **kwargs):
         headers = {'User-Agent': 'OpenAlexHarvester/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
         retry_wait = self.DEFAULT_RETRY_SECONDS
@@ -913,6 +940,7 @@ class MySickle(Sickle):
 
                 if not http_response.text.strip():
                     raise Exception("Empty response received from server")
+                self._strip_php_notice_prefix(http_response)
                 response_start = http_response.text.strip()[:100].lower()
                 if not (response_start.startswith('<?xml') or response_start.startswith('<oai-pmh')):
                     raise Exception(f"Invalid XML response: {http_response.text[:100]}")
