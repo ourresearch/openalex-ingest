@@ -827,6 +827,9 @@ class MySickle(Sickle):
             kwargs['timeout'] = (30, 300)
         if 'irdb.nii.ac.jp' in args[0]:
             kwargs['timeout'] = (120, 600)
+        if 'et.ippt.pan.pl' in args[0]:
+            # Engineering Transactions: ~100 s per OAI response from the harvester (oxjob #1407/#1417)
+            kwargs['timeout'] = (60, 300)
         self.logger = get_thread_logger()
         super(MySickle, self).__init__(*args, **kwargs)
 
