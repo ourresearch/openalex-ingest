@@ -41,7 +41,7 @@ The harvester now uses these columns to track endpoint health:
 PARALLELIZATION:
 - Uses ThreadPoolExecutor with 100 concurrent workers
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
-- 15-second connect / 60-second read timeout per request (oxjob #1425 H2)
+- 30-second connect / 60-second read timeout per request (oxjob #1425 H2, H2b)
 - Total runtime: ~15 minutes for all ~5,000 endpoints
 """
 
@@ -91,7 +91,7 @@ from common import Base, LOGGER, S3_BUCKET, Session, db
 # Parallelization settings
 MAX_WORKERS = 100           # Total concurrent harvesting threads
 MAX_PER_HOST = 3            # Max concurrent requests to same host
-REQUEST_TIMEOUT = 15        # Connect timeout (seconds)
+REQUEST_TIMEOUT = 30        # Connect timeout (seconds); Python counts the TLS handshake here, slow hosts need 20-30 s (oxjob #1425 H2b)
 # Read timeout (seconds). Small OJS installs routinely take 20-30 s to render a ListRecords
 # page; at 15 s they failed every night while dead hosts still fail fast on connect
 # (oxjob #1425 H2: 9 OJS feeds, 13K held records, plus 3 new #1417 feeds).

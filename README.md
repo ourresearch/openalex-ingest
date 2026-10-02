@@ -86,6 +86,6 @@ Settings are defined at the top of `repositories.py`:
 ```python
 MAX_WORKERS = 100       # Total concurrent threads
 MAX_PER_HOST = 3        # Max concurrent requests per host
-REQUEST_TIMEOUT = 15    # Seconds before giving up
+REQUEST_TIMEOUT = 30    # Connect timeout; READ_TIMEOUT = 60 for the body
 BATCH_SIZE = 5000       # Records per S3 file
 ```
