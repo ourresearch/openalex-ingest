@@ -39,7 +39,8 @@ The harvester now uses these columns to track endpoint health:
   - last_error_message: Error details if harvest failed
 
 PARALLELIZATION:
-- Uses ThreadPoolExecutor with 100 concurrent workers
+- Uses ThreadPoolExecutor with 100 concurrent workers; hosts that answer 403 are paced and retried,
+  and still-blocked endpoints get a quiet second pass at the end of the run (oxjob #1425)
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
 - 30-second connect / 60-second read timeout per request (oxjob #1425 H2, H2b)
 - Total runtime: ~15 minutes for all ~5,000 endpoints
@@ -96,6 +97,15 @@ REQUEST_TIMEOUT = 30        # Connect timeout (seconds); Python counts the TLS h
 # page; at 15 s they failed every night while dead hosts still fail fast on connect
 # (oxjob #1425 H2: 9 OJS feeds, 13K held records, plus 3 new #1417 feeds).
 READ_TIMEOUT = 60
+# Hosts that answer 403 under the daily run's load but serve a lone request (632 endpoints on
+# 2026-10-03, mostly Cloudflare bot-score/rate actions; oxjob #1425): after a 403 the host is
+# paced (one request every SLOW_HOST_INTERVAL s, doubling per further 403) and the request is
+# retried after these waits; endpoints still blocked at the end of the run get one more pass
+# with RETRY_BLOCKED_WORKERS threads once the load is gone.
+BLOCKED_RETRY_WAITS = (30, 60, 120)
+SLOW_HOST_INTERVAL = 3.0
+SLOW_HOST_MAX_INTERVAL = 15.0
+RETRY_BLOCKED_WORKERS = 5
 BATCH_SIZE = 5000           # Records per S3 file
 EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
 # Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
@@ -281,6 +291,39 @@ class HostRateLimiter:
         self.max_per_host = max_per_host
         self._semaphores = defaultdict(lambda: threading.Semaphore(self.max_per_host))
         self._lock = threading.Lock()
+        self._slow = {}        # host -> seconds between requests, once the host has answered 403
+        self._next_slot = {}   # host -> epoch seconds when the next paced request may start
+        self._pace_locks = defaultdict(threading.Lock)
+
+    @staticmethod
+    def _host(url):
+        return urlparse(url).hostname
+
+    def mark_slow(self, url: str, interval: float = SLOW_HOST_INTERVAL) -> float:
+        """Pace a host after a 403: first call sets `interval`, each later one doubles it."""
+        host = self._host(url)
+        with self._lock:
+            current = self._slow.get(host)
+            new = min(max(interval, current * 2), SLOW_HOST_MAX_INTERVAL) if current else interval
+            self._slow[host] = new
+            return new
+
+    def is_slow(self, url: str) -> bool:
+        with self._lock:
+            return self._host(url) in self._slow
+
+    def pace(self, url: str):
+        """Before a request: if the host is paced, wait for its next slot (serialises its threads)."""
+        host = self._host(url)
+        with self._lock:
+            interval = self._slow.get(host)
+        if not interval:
+            return
+        with self._pace_locks[host]:
+            wait = self._next_slot.get(host, 0) - time()
+            if wait > 0:
+                sleep(wait)
+            self._next_slot[host] = time() + interval
 
     def get_semaphore(self, url: str) -> threading.Semaphore:
         """Get the semaphore for a URL's host."""
@@ -891,10 +934,14 @@ class MySickle(Sickle):
     def harvest(self, **kwargs):
         headers = {'User-Agent': 'OpenAlexHarvester/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
         retry_wait = self.DEFAULT_RETRY_SECONDS
+        attempt = 0
+        blocked_attempts = 0
 
-        for attempt in range(self.max_retries):
+        while attempt < self.max_retries:
+            attempt += 1
             self._check_deadline()
             try:
+                host_rate_limiter.pace(self.endpoint)
                 if self.http_method == 'GET':
                     payload_str = "&".join(f"{k}={v}" for k, v in kwargs.items())
                     url = f"{self.endpoint}?{payload_str}"
@@ -923,6 +970,20 @@ class MySickle(Sickle):
                     self.logger.info(f"HTTP 503! Retrying after {retry_wait} seconds...")
                     self._check_deadline(retry_wait)
                     sleep(retry_wait)
+                    continue
+                elif http_response.status_code == 403 and blocked_attempts < len(BLOCKED_RETRY_WAITS):
+                    # Cloudflare-style bot/rate action: slow this host down for the rest of the run
+                    # and try again after a real pause (oxjob #1425). A 403 on every retry still
+                    # raises below and classifies as 'blocked'.
+                    wait = self._retry_after(http_response.headers.get('Retry-After'),
+                                             BLOCKED_RETRY_WAITS[blocked_attempts])
+                    interval = host_rate_limiter.mark_slow(self.endpoint)
+                    blocked_attempts += 1
+                    attempt -= 1  # 403 retries do not consume the generic retries
+                    self.logger.warning(f"HTTP 403 from {self.endpoint}: pacing host at {interval:.0f} s/request, "
+                                        f"retry {blocked_attempts}/{len(BLOCKED_RETRY_WAITS)} after {wait} s")
+                    self._check_deadline(wait)
+                    sleep(wait)
                     continue
                 elif http_response.status_code == 429:
                     retry_after = http_response.headers.get('Retry-After')
@@ -954,7 +1015,8 @@ class MySickle(Sickle):
                 raise
             except Exception as e:
                 LOGGER.error(f"Error harvesting from {self.endpoint}: {str(e)}")
-                if attempt == self.max_retries - 1:
+                still_403 = getattr(getattr(e, 'response', None), 'status_code', None) == 403
+                if attempt >= self.max_retries or (still_403 and blocked_attempts >= len(BLOCKED_RETRY_WAITS)):
                     raise
                 self.logger.info(f"Retrying after {retry_wait} seconds due to error...")
                 self._check_deadline(retry_wait)
@@ -1291,12 +1353,44 @@ def harvest_single_endpoint_with_date_detection(
     return harvest_single_endpoint(endpoint_id, pmh_url, s3_bucket, start_date, end_date)
 
 
+def retry_blocked_endpoints(blocked, s3_bucket, end_date, max_workers=RETRY_BLOCKED_WORKERS) -> dict:
+    """
+    Second, quiet pass over endpoints that ended the run 'blocked' on a 403: few threads, every
+    host paced at the maximum interval. Hosts that only 403 under load pass here (oxjob #1425).
+    blocked: list of (endpoint_id, pmh_url, start_date). Returns {status: count}.
+    """
+    logger = logging.getLogger("harvester.main")
+    stats = {}
+    if not blocked or max_workers <= 0:
+        return stats
+    logger.info(f"Retrying {len(blocked)} blocked endpoints with {max_workers} workers, hosts paced")
+    for _, pmh_url, _ in blocked:
+        host_rate_limiter.mark_slow(pmh_url, SLOW_HOST_MAX_INTERVAL)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(harvest_single_endpoint, eid, url, s3_bucket, start, end_date): url
+                   for eid, url, start in blocked}
+        for future in as_completed(futures):
+            try:
+                _, status, _, _ = future.result()
+            except Exception as e:
+                logger.error(f"Blocked retry failed for {futures[future]}: {e}")
+                status = 'connection_error'
+            stats[status] = stats.get(status, 0) + 1
+    logger.info(f"Blocked retry pass: {stats}")
+    return stats
+
+
+def _is_403(error_msg) -> bool:
+    return bool(error_msg) and '403' in str(error_msg)
+
+
 def harvest_all_endpoints(
     endpoint_data: List[Tuple[str, str]],
     s3_bucket: str,
     start_date,
     end_date,
-    max_workers: int = MAX_WORKERS
+    max_workers: int = MAX_WORKERS,
+    retry_blocked_workers: int = RETRY_BLOCKED_WORKERS
 ) -> dict:
     """
     Harvest all endpoints in parallel with rate limiting.
@@ -1340,14 +1434,21 @@ def harvest_all_endpoints(
             for endpoint_id, pmh_url in endpoint_data
         }
 
+        blocked = []
         for future in as_completed(futures):
             endpoint_id, pmh_url = futures[future]
             try:
                 result_id, status, response_time, error_msg = future.result()
                 stats[status] = stats.get(status, 0) + 1
+                if status == 'blocked' and _is_403(error_msg):
+                    blocked.append((endpoint_id, pmh_url, start_date))
             except Exception as e:
                 logger.error(f"Unexpected error for endpoint {pmh_url}: {e}")
                 stats['connection_error'] += 1
+
+    retry_stats = retry_blocked_endpoints(blocked, s3_bucket, end_date, retry_blocked_workers)
+    stats['blocked_recovered'] = retry_stats.get('success', 0) + retry_stats.get('empty', 0)
+    stats['blocked'] -= stats['blocked_recovered']
 
     stats['total_time'] = time() - start_time
 
@@ -1388,6 +1489,9 @@ Examples:
                         help='Harvest all harvestable endpoints (recommended for daily job)')
     parser.add_argument('--n_threads', type=int, default=MAX_WORKERS,
                         help=f'Number of concurrent harvesting threads (default: {MAX_WORKERS})')
+    parser.add_argument('--retry-blocked-threads', type=int, default=RETRY_BLOCKED_WORKERS,
+                        help=f'Threads for the end-of-run retry of 403-blocked endpoints, hosts paced '
+                             f'(default: {RETRY_BLOCKED_WORKERS}; 0 disables)')
 
     # Legacy flags (kept for backwards compatibility but deprecated)
     parser.add_argument('--core-endpoints', action='store_true',
@@ -1453,7 +1557,8 @@ Examples:
             s3_bucket=S3_BUCKET,
             start_date=start_date,
             end_date=end_date,
-            max_workers=args.n_threads
+            max_workers=args.n_threads,
+            retry_blocked_workers=args.retry_blocked_threads
         )
     else:
         # Compute per-endpoint start dates based on most_recent_date_harvested
@@ -1462,6 +1567,7 @@ Examples:
 
         with ThreadPoolExecutor(max_workers=args.n_threads) as executor:
             futures = {}
+            first_dates = {}
 
             for endpoint_id, pmh_url, most_recent in endpoint_data:
                 if most_recent:
@@ -1469,6 +1575,7 @@ Examples:
                 else:
                     # Never checkpointed: first harvest, no 'from' (see call_pmh_endpoint)
                     first_date = None
+                first_dates[endpoint_id] = first_date
 
                 future = executor.submit(
                     harvest_single_endpoint_with_date_detection,
@@ -1492,14 +1599,22 @@ Examples:
                 'oai_error': 0
             }
 
+            blocked = []
             for future in as_completed(futures):
                 endpoint_id, pmh_url = futures[future]
                 try:
                     result_id, status, response_time, error_msg = future.result()
                     stats[status] = stats.get(status, 0) + 1
+                    if status == 'blocked' and _is_403(error_msg):
+                        blocked.append((endpoint_id, pmh_url, first_dates[endpoint_id]))
                 except Exception as e:
                     logger.error(f"Harvesting task failed for {pmh_url}: {str(e)}")
                     stats['connection_error'] += 1
+
+        if not args.endpoint_id:
+            retry_stats = retry_blocked_endpoints(blocked, S3_BUCKET, end_date, args.retry_blocked_threads)
+            stats['blocked_recovered'] = retry_stats.get('success', 0) + retry_stats.get('empty', 0)
+            stats['blocked'] -= stats['blocked_recovered']
 
         logger.info(f"Harvest complete: {stats}")
 
