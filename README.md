@@ -31,6 +31,9 @@ python repositories.py --all-endpoints --n_threads 100
 # Hosts answering 403 are paced and retried; endpoints still blocked get a quiet end-of-run pass (0 disables)
 python repositories.py --all-endpoints --n_threads 100 --retry-blocked-threads 5
 
+# Re-run only the endpoints whose last health status is in the list
+python repositories.py --all-endpoints --health-status blocked --n_threads 50
+
 # Harvest a specific endpoint
 python repositories.py --endpoint-id abc123
 

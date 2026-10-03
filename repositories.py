@@ -222,13 +222,14 @@ class StateManager:
         session.commit()
 
     @staticmethod
-    def get_all_harvestable_endpoints(session) -> List[Endpoint]:
+    def get_all_harvestable_endpoints(session, health_statuses=None) -> List[Endpoint]:
         """
         Get all endpoints that should be harvested.
 
         Criteria:
         - ready_to_run == True
         - in_walden == True (part of OpenAlex pipeline)
+        - optionally last_health_status in `health_statuses` (re-run only e.g. the blocked ones)
 
         Unlike the old tiering system, this returns ALL harvestable endpoints.
         The parallelization handles the load efficiently.
@@ -238,7 +239,10 @@ class StateManager:
         stmt = select(Endpoint).filter(
             Endpoint.ready_to_run == True,
             Endpoint.in_walden == True
-        ).execution_options(yield_per=500)
+        )
+        if health_statuses:
+            stmt = stmt.filter(Endpoint.last_health_status.in_(list(health_statuses)))
+        stmt = stmt.execution_options(yield_per=500)
         return list(session.execute(stmt).scalars())
 
     @staticmethod
@@ -1489,6 +1493,9 @@ Examples:
                         help='Harvest all harvestable endpoints (recommended for daily job)')
     parser.add_argument('--n_threads', type=int, default=MAX_WORKERS,
                         help=f'Number of concurrent harvesting threads (default: {MAX_WORKERS})')
+    parser.add_argument('--health-status',
+                        help='With --all-endpoints: only endpoints whose last_health_status is in this '
+                             'comma-separated list (e.g. blocked,timeout) for a targeted re-run')
     parser.add_argument('--retry-blocked-threads', type=int, default=RETRY_BLOCKED_WORKERS,
                         help=f'Threads for the end-of-run retry of 403-blocked endpoints, hosts paced '
                              f'(default: {RETRY_BLOCKED_WORKERS}; 0 disables)')
@@ -1528,9 +1535,10 @@ Examples:
         endpoint_data = [(endpoint.id, endpoint.pmh_url, endpoint.most_recent_date_harvested)]
         logger.info(f"Harvesting single endpoint: {endpoint.pmh_url}")
     elif args.all_endpoints:
-        endpoints = StateManager.get_all_harvestable_endpoints(db)
+        statuses = [x.strip() for x in args.health_status.split(',')] if args.health_status else None
+        endpoints = StateManager.get_all_harvestable_endpoints(db, statuses)
         endpoint_data = [(e.id, e.pmh_url, e.most_recent_date_harvested) for e in endpoints]
-        logger.info(f"Found {len(endpoint_data)} harvestable endpoints")
+        logger.info(f"Found {len(endpoint_data)} harvestable endpoints" + (f" with status in {statuses}" if statuses else ""))
     else:
         # Default to all endpoints
         endpoints = StateManager.get_all_harvestable_endpoints(db)
