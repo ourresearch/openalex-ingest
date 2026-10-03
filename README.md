@@ -34,6 +34,9 @@ python repositories.py --all-endpoints --n_threads 100 --retry-blocked-threads 5
 # Re-run only the endpoints whose last health status is in the list
 python repositories.py --all-endpoints --health-status blocked --n_threads 50
 
+# Endpoints with the registry flag fetch_via_zyte are fetched through the Zyte API (plain mode, needs ZYTE_API_KEY);
+# a Cloudflare managed challenge on a direct request sets the flag automatically (oxjob #1425)
+
 # Harvest a specific endpoint
 python repositories.py --endpoint-id abc123
 

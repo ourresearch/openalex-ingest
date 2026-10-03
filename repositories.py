@@ -43,10 +43,13 @@ PARALLELIZATION:
   and still-blocked endpoints get a quiet second pass at the end of the run (oxjob #1425)
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
 - 30-second connect / 60-second read timeout per request (oxjob #1425 H2, H2b)
+- Endpoints flagged fetch_via_zyte are fetched through the Zyte API (plain mode); a Cloudflare
+  challenge on a direct request flags the endpoint automatically (oxjob #1425; needs ZYTE_API_KEY)
 - Total runtime: ~15 minutes for all ~5,000 endpoints
 """
 
 import argparse
+import base64
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -68,6 +71,7 @@ import defusedxml.ElementTree as DefusedET
 from defusedxml.ElementTree import ParseError
 import requests
 from requests.adapters import HTTPAdapter
+from requests.structures import CaseInsensitiveDict
 import ssl
 import certifi
 from cryptography import x509
@@ -106,6 +110,16 @@ BLOCKED_RETRY_WAITS = (30, 60, 120)
 SLOW_HOST_INTERVAL = 3.0
 SLOW_HOST_MAX_INTERVAL = 15.0
 RETRY_BLOCKED_WORKERS = 5
+# Cloudflare serves a managed challenge (cf-mitigated: challenge) to the harvester on ~709 endpoints /
+# 335 hosts: it keys on our datacenter IP combined with the dyno's old-OpenSSL TLS fingerprint, so
+# pacing and retries never clear it, while the same request fetched by Zyte's API does (oxjob #1425,
+# 2026-10-03; Casey: "go the Zyte route but limit it to the endpoints that need it"). An endpoint
+# with fetch_via_zyte set has every OAI request fetched through Zyte (plain httpResponseBody mode, no
+# browser rendering, our User-Agent). The flag is seeded from #1425's probe and adopted automatically
+# when a direct request answers a Cloudflare challenge and the Zyte fetch of the same URL succeeds.
+# Without ZYTE_API_KEY the harvester just goes direct and logs it once.
+ZYTE_API_URL = "https://api.zyte.com/v1/extract"
+ZYTE_TIMEOUT = (15, 120)    # Zyte solves the challenge itself; 17 s seen for a slow host
 BATCH_SIZE = 5000           # Records per S3 file
 EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
 # Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
@@ -187,6 +201,7 @@ class Endpoint(Base):
     last_response_time = Column(Float)    # seconds
     last_error_message = Column(Text)     # details if failed
     last_record_count = Column(BigInteger)  # records retrieved in the attempt stamped by last_health_check (partial on failure); oxjob #804
+    fetch_via_zyte = Column(Boolean)      # OAI requests go through the Zyte API (Cloudflare challenge on the direct path); oxjob #1425
 
     def __init__(self, **kwargs):
         super(self.__class__, self).__init__(**kwargs)
@@ -443,6 +458,13 @@ class EndpointHarvester:
         self.logger = get_thread_logger()
         self.date_format = self.detect_date_format()
 
+    def _adopt_zyte(self):
+        """A direct request met a Cloudflare challenge and Zyte took over (oxjob #1425): remember it
+        on the endpoint row, persisted by the health update that follows the harvest."""
+        if not self.state.fetch_via_zyte:
+            self.state.fetch_via_zyte = True
+            self.logger.warning(f"Endpoint {self.state.id} now fetches via Zyte ({self.state.pmh_url})")
+
     def harvest(self, s3_bucket, first=None, last=None):
         """
         Harvest records from the endpoint over the given date range.
@@ -527,7 +549,9 @@ class EndpointHarvester:
         self.logger.info(f"OAI-PMH request parameters: {args}")
 
         try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics)
+            my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics,
+                                       fetch_via_zyte=bool(self.state.fetch_via_zyte),
+                                       on_zyte_adopted=self._adopt_zyte)
             my_sickle.deadline = deadline  # MySickle stops retrying/sleeping past it
             records = self._make_oai_request(my_sickle, **args)
 
@@ -751,7 +775,9 @@ class EndpointHarvester:
     def detect_date_format(self):
         """Detect if the repository requires a full timestamp format or just 'YYYY-MM-DD'."""
         try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=(10, READ_TIMEOUT))
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=(10, READ_TIMEOUT),
+                                       fetch_via_zyte=bool(self.state.fetch_via_zyte),
+                                       on_zyte_adopted=self._adopt_zyte)
             identify = my_sickle.Identify()
             earliest = identify.earliestDatestamp
 
@@ -783,7 +809,9 @@ class EndpointHarvester:
             return datetime(2000, 1, 1)
 
         try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=(10, READ_TIMEOUT))
+            my_sickle = _get_my_sickle(self.state.pmh_url, timeout=(10, READ_TIMEOUT),
+                                       fetch_via_zyte=bool(self.state.fetch_via_zyte),
+                                       on_zyte_adopted=self._adopt_zyte)
             identify = my_sickle.Identify()
             earliest = identify.earliestDatestamp
 
@@ -874,6 +902,77 @@ class OSTIItemIterator(MyOAIItemIterator):
             './/' + self.sickle.oai_namespace + self.element)
 
 
+# =============================================================================
+# ZYTE TRANSPORT (oxjob #1425)
+# =============================================================================
+
+_zyte_counter = {'requests': 0, 'warned': False}
+_zyte_lock = threading.Lock()
+
+
+class ZyteBan(Exception):
+    """Zyte API 520: it could not get a ban-free response from the site. Not retried."""
+
+
+def zyte_available() -> bool:
+    if os.getenv("ZYTE_API_KEY"):
+        return True
+    with _zyte_lock:
+        if not _zyte_counter['warned']:
+            _zyte_counter['warned'] = True
+            LOGGER.warning("ZYTE_API_KEY not set: endpoints flagged fetch_via_zyte are fetched directly")
+    return False
+
+
+def zyte_requests_made() -> int:
+    with _zyte_lock:
+        return _zyte_counter['requests']
+
+
+def is_cloudflare_challenge(http_response) -> bool:
+    """Cloudflare's managed/JS challenge; the header is authoritative, the title is the fallback."""
+    if http_response.headers.get('cf-mitigated', '').lower() == 'challenge':
+        return True
+    return 'cf-ray' in http_response.headers and b'<title>Just a moment...</title>' in (http_response.content or b'')[:4000]
+
+
+def zyte_get(url: str, headers: dict) -> requests.Response:
+    """GET `url` through the Zyte API in plain mode (httpResponseBody, no browser) with our headers.
+
+    Returns a requests.Response carrying the target site's status, headers and decoded body, so the
+    caller's 403/503/raise_for_status/XML checks work unchanged. A failure of the Zyte call itself
+    raises; classify_error maps it to connection_error."""
+    api_key = os.environ["ZYTE_API_KEY"]
+    payload = {
+        'url': url,
+        'httpResponseBody': True,
+        'httpResponseHeaders': True,
+        'customHttpRequestHeaders': [{'name': k, 'value': v} for k, v in headers.items()],
+    }
+    with _zyte_lock:
+        _zyte_counter['requests'] += 1
+    api_response = requests.post(ZYTE_API_URL, auth=(api_key, ''), json=payload, timeout=ZYTE_TIMEOUT)
+    if api_response.status_code == 520:
+        # Zyte could not get a ban-free response either: the site is blocked for us, full stop.
+        # No retries (each attempt is a minute or more of Zyte's own effort); classifies 'blocked'.
+        raise ZyteBan(f"Zyte website ban (blocked) for {url}: {api_response.text[:200]}")
+    if api_response.status_code != 200:
+        detail = api_response.text[:300]
+        raise requests.exceptions.ConnectionError(f"Zyte API {api_response.status_code} for {url}: {detail}")
+    data = api_response.json()
+    response = requests.Response()
+    response.status_code = int(data.get('statusCode') or 500)
+    response.reason = ''
+    response.url = data.get('url') or url
+    # the body comes back already decoded; drop the transfer headers that would say otherwise
+    response.headers = CaseInsensitiveDict({h['name']: h['value'] for h in data.get('httpResponseHeaders', [])
+                                            if h['name'].lower() not in ('content-encoding', 'content-length', 'transfer-encoding')})
+    response._content = base64.b64decode(data['httpResponseBody']) if data.get('httpResponseBody') else b''
+    response.encoding = None  # let requests sniff it from the XML declaration / content-type
+    response.request = requests.Request('GET', url, headers=headers).prepare()
+    return response
+
+
 class MySickle(Sickle):
     """Custom Sickle client with retry logic and special handling."""
 
@@ -883,6 +982,12 @@ class MySickle(Sickle):
         self.metrics_logger = None
         self.deadline = None  # epoch seconds; set by call_pmh_endpoint for first harvests
         self.http_method = kwargs.get('http_method', 'GET')
+        # oxjob #1425: fetch through the Zyte API instead of directly (Cloudflare challenge on the
+        # direct path). zyte_adopted turns True when a challenge was met mid-run and Zyte took over;
+        # on_zyte_adopted lets the harvester persist that on the endpoint row.
+        self.fetch_via_zyte = bool(kwargs.pop('fetch_via_zyte', False))
+        self.on_zyte_adopted = kwargs.pop('on_zyte_adopted', None)
+        self.zyte_adopted = False
         kwargs['max_retries'] = kwargs.get('max_retries', 3)
         if 'osti.gov/oai' in args[0]:
             kwargs['timeout'] = (30, 300)
@@ -953,9 +1058,25 @@ class MySickle(Sickle):
                         doaj_api_key = os.getenv("DOAJ_API_KEY")
                         if doaj_api_key:
                             url += f"&api_key={doaj_api_key}"
-                    http_response = _tls_tolerant_request('get', url, headers=headers, **self.request_args)
+                    if self.fetch_via_zyte and zyte_available():
+                        http_response = zyte_get(url, headers)
+                    else:
+                        http_response = _tls_tolerant_request('get', url, headers=headers, **self.request_args)
                 else:
                     http_response = _tls_tolerant_request('post', self.endpoint, headers=headers, data=kwargs, **self.request_args)
+
+                if (http_response.status_code == 403 and not self.fetch_via_zyte and zyte_available()
+                        and is_cloudflare_challenge(http_response)):
+                    # Cloudflare managed challenge on the direct path (oxjob #1425): it keys on our
+                    # datacenter IP + TLS fingerprint, so waiting does not help; switch this endpoint
+                    # to Zyte for the rest of the harvest and persist the flag for the next run.
+                    self.fetch_via_zyte = True
+                    self.zyte_adopted = True
+                    if self.on_zyte_adopted:
+                        self.on_zyte_adopted()
+                    self.logger.warning(f"Cloudflare challenge from {self.endpoint}: switching to Zyte")
+                    attempt -= 1
+                    continue
 
                 if self.metrics_logger:
                     self.metrics_logger.update_url(http_response.url)
@@ -1015,7 +1136,7 @@ class MySickle(Sickle):
 
                 return OAIResponse(http_response, params=kwargs)
 
-            except FirstHarvestDeadline:
+            except (FirstHarvestDeadline, ZyteBan):
                 raise
             except Exception as e:
                 LOGGER.error(f"Error harvesting from {self.endpoint}: {str(e)}")
@@ -1123,7 +1244,8 @@ def _tls_tolerant_request(method, url, **kwargs):
         return getattr(_tls_fallback_session(url), method)(url, **kwargs)
 
 
-def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=(REQUEST_TIMEOUT, READ_TIMEOUT)):
+def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=(REQUEST_TIMEOUT, READ_TIMEOUT),
+                   fetch_via_zyte=False, on_zyte_adopted=None):
     """Create a customized Sickle client for the given URL."""
     if not repo_pmh_url:
         return None
@@ -1134,7 +1256,8 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=(REQUEST_TIMEOUT, 
     proxy_url = os.getenv("QUOTAGUARDSTATIC_URL") or os.getenv("STATIC_IP_PROXY")
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else {}
     iterator = OSTIItemIterator if 'osti.gov/oai' in repo_pmh_url else MyOAIItemIterator
-    sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=iterator)
+    sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=iterator,
+                      fetch_via_zyte=fetch_via_zyte, on_zyte_adopted=on_zyte_adopted)
 
     if metrics_logger:
         sickle.set_metrics_logger(metrics_logger)
@@ -1452,6 +1575,7 @@ def harvest_all_endpoints(
 
     retry_stats = retry_blocked_endpoints(blocked, s3_bucket, end_date, retry_blocked_workers)
     stats['blocked_recovered'] = retry_stats.get('success', 0) + retry_stats.get('empty', 0)
+    stats['zyte_requests'] = zyte_requests_made()
     stats['blocked'] -= stats['blocked_recovered']
 
     stats['total_time'] = time() - start_time
@@ -1622,6 +1746,7 @@ Examples:
         if not args.endpoint_id:
             retry_stats = retry_blocked_endpoints(blocked, S3_BUCKET, end_date, args.retry_blocked_threads)
             stats['blocked_recovered'] = retry_stats.get('success', 0) + retry_stats.get('empty', 0)
+            stats['zyte_requests'] = zyte_requests_made()
             stats['blocked'] -= stats['blocked_recovered']
 
         logger.info(f"Harvest complete: {stats}")
