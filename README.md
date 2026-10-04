@@ -28,7 +28,7 @@ This replaced a complex 4-tier system that scheduled endpoints separately based 
 # Daily job (recommended): harvest all endpoints in parallel
 python repositories.py --all-endpoints --n_threads 100
 
-# Hosts answering 403 are paced and retried; endpoints still blocked get a quiet end-of-run pass (0 disables)
+# Optional end-of-run second pass over 403-blocked endpoints (off by default; ~4.5 min per endpoint)
 python repositories.py --all-endpoints --n_threads 100 --retry-blocked-threads 5
 
 # Re-run only the endpoints whose last health status is in the list

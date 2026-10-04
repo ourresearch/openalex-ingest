@@ -39,8 +39,8 @@ The harvester now uses these columns to track endpoint health:
   - last_error_message: Error details if harvest failed
 
 PARALLELIZATION:
-- Uses ThreadPoolExecutor with 100 concurrent workers; hosts that answer 403 are paced and retried,
-  and still-blocked endpoints get a quiet second pass at the end of the run (oxjob #1425)
+- Uses ThreadPoolExecutor with 100 concurrent workers; a plain 403 paces the host and gets one retry;
+  Cloudflare challenges switch the endpoint to Zyte (oxjob #1425)
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
 - 30-second connect / 60-second read timeout per request (oxjob #1425 H2, H2b)
 - Endpoints flagged fetch_via_zyte are fetched through the Zyte API (plain mode); a Cloudflare
@@ -101,15 +101,15 @@ REQUEST_TIMEOUT = 30        # Connect timeout (seconds); Python counts the TLS h
 # page; at 15 s they failed every night while dead hosts still fail fast on connect
 # (oxjob #1425 H2: 9 OJS feeds, 13K held records, plus 3 new #1417 feeds).
 READ_TIMEOUT = 60
-# Hosts that answer 403 under the daily run's load but serve a lone request (632 endpoints on
-# 2026-10-03, mostly Cloudflare bot-score/rate actions; oxjob #1425): after a 403 the host is
-# paced (one request every SLOW_HOST_INTERVAL s, doubling per further 403) and the request is
-# retried after these waits; endpoints still blocked at the end of the run get one more pass
-# with RETRY_BLOCKED_WORKERS threads once the load is gone.
-BLOCKED_RETRY_WAITS = (30, 60, 120)
+# A plain 403 (not a Cloudflare challenge, which switches the endpoint to Zyte) paces the host
+# (one request every SLOW_HOST_INTERVAL s, doubling per further 403) and gets one retry after
+# BLOCKED_RETRY_WAITS. Measured 2026-10-03/04 (oxjob #1425): 5 of 644 non-Cloudflare 403s
+# recovered on retry, and an end-of-run pass over the still-blocked rows cost ~4.5 min each
+# (~70 h for 942), so the pass is off by default; --retry-blocked-threads N turns it on.
+BLOCKED_RETRY_WAITS = (30,)
 SLOW_HOST_INTERVAL = 3.0
 SLOW_HOST_MAX_INTERVAL = 15.0
-RETRY_BLOCKED_WORKERS = 5
+RETRY_BLOCKED_WORKERS = 0
 # Cloudflare serves a managed challenge (cf-mitigated: challenge) to the harvester on ~709 endpoints /
 # 335 hosts: it keys on our datacenter IP combined with the dyno's old-OpenSSL TLS fingerprint, so
 # pacing and retries never clear it, while the same request fetched by Zyte's API does (oxjob #1425,
