@@ -1023,6 +1023,23 @@ class MySickle(Sickle):
         rb'(?:<b>[^<]{0,500}</b>[^<]{0,100}){0,2}<br\s*/?>',
         re.IGNORECASE)
 
+    # XML 1.0 forbids these control characters anywhere in a document (#x9, #xA, #xD and #x20+ are
+    # the only ones allowed below #xD7FF). OJS installs pass them through from pasted abstracts and
+    # titles, and every strict parser then rejects the whole page: 1,323 OJS feeds (208K records)
+    # on 2026-10-04, plus most "malformed" repository feeds (oxjob #1417). A clean document never
+    # contains them, so the search finds nothing and the bytes are left exactly as received.
+    _XML_BAD_CTRL = re.compile(rb'[\x00-\x08\x0B\x0C\x0E-\x1F]')
+
+    def _strip_invalid_xml_chars(self, http_response):
+        content = http_response.content
+        if content[:2] in (b'\xff\xfe', b'\xfe\xff') or b'utf-16' in content[:120].lower():
+            return  # NUL bytes are data in UTF-16; OAI-PMH mandates UTF-8, so this never fires in practice
+        if not self._XML_BAD_CTRL.search(content):
+            return
+        cleaned, n = self._XML_BAD_CTRL.subn(b'', content)
+        http_response._content = cleaned
+        LOGGER.warning(f"Stripped {n} invalid XML control character(s) from {self.endpoint}")
+
     def _strip_php_notice_prefix(self, http_response):
         content = http_response.content
         start = content.find(b'<?xml')
@@ -1127,6 +1144,7 @@ class MySickle(Sickle):
                 if not http_response.text.strip():
                     raise Exception("Empty response received from server")
                 self._strip_php_notice_prefix(http_response)
+                self._strip_invalid_xml_chars(http_response)
                 response_start = http_response.text.strip()[:100].lower()
                 if not (response_start.startswith('<?xml') or response_start.startswith('<oai-pmh')):
                     raise Exception(f"Invalid XML response: {http_response.text[:100]}")
