@@ -61,6 +61,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 from time import sleep, time
 from typing import Optional, List, Tuple
 from urllib.parse import urlparse
@@ -122,6 +123,10 @@ ZYTE_API_URL = "https://api.zyte.com/v1/extract"
 ZYTE_TIMEOUT = (15, 120)    # Zyte solves the challenge itself; 17 s seen for a slow host
 BATCH_SIZE = 5000           # Records per S3 file
 BOT_CHALLENGE_RE = re.compile(r"anubis|making sure you(?:'|&#39;|’)re not a bot", re.I)
+# Hosts whose 403s, once paced retries are spent, switch the endpoint to Zyte (an IP block, not
+# Cloudflare). HAL: Jason, 2026-10-08 (oxjob #1588): "If we start getting blocked, I would like to
+# switch to Zyte" rather than wait for HAL to allowlist our static IP.
+ZYTE_AFTER_403_HOSTS = {"api.archives-ouvertes.fr"}
 # Endpoints whose records must not land under repositories/, which Repo.py reads with a fixed oai_dc
 # schema: each has its own S3 folder and its own walden pipeline. IRDB (jpcoar_2.0) -> IRDB.py; all of
 # HAL in xml-tei -> HalTei.py (oxjob #1588; under repositories/ it would collide with the oai_dc HAL rows,
@@ -945,12 +950,59 @@ def is_cloudflare_challenge(http_response) -> bool:
     return 'cf-ray' in http_response.headers and b'<title>Just a moment...</title>' in (http_response.content or b'')[:4000]
 
 
-def zyte_get(url: str, headers: dict) -> requests.Response:
+def is_bot_challenge(http_response) -> bool:
+    """An HTML proof-of-work wall such as Anubis (HAL's, oxjob #1402), whatever the status code."""
+    head = (http_response.content or b'')[:20000]
+    if head.lstrip()[:5].lower() in (b'<?xml', b'<oai-'):
+        return False
+    return bool(BOT_CHALLENGE_RE.search(head.decode('utf-8', 'replace')))
+
+
+def zyte_get(url: str, headers: dict, session_init_url: Optional[str] = None) -> requests.Response:
     """GET `url` through the Zyte API in plain mode (httpResponseBody, no browser) with our headers.
+
+    session_init_url: for an Anubis-style wall, which plain mode alone does not pass (it returns the
+    challenge page). The request then runs in a Zyte session, one per host, opened by a single browser
+    visit to that URL; plain fetches in that session return the real raw body (tested on hal.science,
+    oxjob #1588). Not Zyte's self-managed sessions with an opening action: those return the opening
+    page for every URL. A session that meets the wall again is reopened once.
 
     Returns a requests.Response carrying the target site's status, headers and decoded body, so the
     caller's 403/503/raise_for_status/XML checks work unchanged. A failure of the Zyte call itself
     raises; classify_error maps it to connection_error."""
+    if session_init_url:
+        host = urlparse(url).hostname or ''
+        for reopen in (False, True):
+            session_id = _zyte_session_for(host, session_init_url, reopen=reopen)
+            response = _zyte_plain(url, headers, session_id)
+            if not is_bot_challenge(response):
+                break
+        return response
+    return _zyte_plain(url, headers)
+
+
+_zyte_sessions = {}  # host -> Zyte session id opened past a bot wall (oxjob #1588)
+
+
+def _zyte_session_for(host: str, init_url: str, reopen: bool = False) -> str:
+    with _zyte_lock:
+        if host in _zyte_sessions and not reopen:
+            return _zyte_sessions[host]
+    session_id = str(uuid.uuid4())
+    payload = {'url': init_url, 'browserHtml': True, 'session': {'id': session_id}}  # Zyte's own browser identity
+    with _zyte_lock:
+        _zyte_counter['requests'] += 1
+    api_response = requests.post(ZYTE_API_URL, auth=(os.environ["ZYTE_API_KEY"], ''), json=payload, timeout=ZYTE_TIMEOUT)
+    if api_response.status_code != 200:
+        raise requests.exceptions.ConnectionError(f"Zyte session open {api_response.status_code} for {init_url}: "
+                                                  f"{api_response.text[:300]}")
+    with _zyte_lock:
+        _zyte_sessions[host] = session_id
+    LOGGER.info(f"Opened a Zyte browser session for {host}")
+    return session_id
+
+
+def _zyte_plain(url: str, headers: dict, session_id: Optional[str] = None) -> requests.Response:
     api_key = os.environ["ZYTE_API_KEY"]
     payload = {
         'url': url,
@@ -958,6 +1010,8 @@ def zyte_get(url: str, headers: dict) -> requests.Response:
         'httpResponseHeaders': True,
         'customHttpRequestHeaders': [{'name': k, 'value': v} for k, v in headers.items()],
     }
+    if session_id:
+        payload['session'] = {'id': session_id}
     with _zyte_lock:
         _zyte_counter['requests'] += 1
     api_response = requests.post(ZYTE_API_URL, auth=(api_key, ''), json=payload, timeout=ZYTE_TIMEOUT)
@@ -997,6 +1051,7 @@ class MySickle(Sickle):
         self.fetch_via_zyte = bool(kwargs.pop('fetch_via_zyte', False))
         self.on_zyte_adopted = kwargs.pop('on_zyte_adopted', None)
         self.zyte_adopted = False
+        self.zyte_session_init_url = None  # set when a bot-challenge page is met (see zyte_get)
         kwargs['max_retries'] = kwargs.get('max_retries', 3)
         if 'osti.gov/oai' in args[0]:
             kwargs['timeout'] = (30, 300)
@@ -1007,6 +1062,15 @@ class MySickle(Sickle):
             kwargs['timeout'] = (60, 300)
         self.logger = get_thread_logger()
         super(MySickle, self).__init__(*args, **kwargs)
+
+    def _switch_to_zyte(self, message):
+        """Fetch the rest of this harvest through Zyte; a new adoption is persisted on the endpoint row."""
+        if not self.fetch_via_zyte:
+            self.fetch_via_zyte = True
+            self.zyte_adopted = True
+            if self.on_zyte_adopted:
+                self.on_zyte_adopted()
+        self.logger.warning(message)
 
     def set_metrics_logger(self, metrics_logger):
         self.metrics_logger = metrics_logger
@@ -1085,7 +1149,7 @@ class MySickle(Sickle):
                         if doaj_api_key:
                             url += f"&api_key={doaj_api_key}"
                     if self.fetch_via_zyte and zyte_available():
-                        http_response = zyte_get(url, headers)
+                        http_response = zyte_get(url, headers, session_init_url=self.zyte_session_init_url)
                     else:
                         http_response = _tls_tolerant_request('get', url, headers=headers, **self.request_args)
                 else:
@@ -1096,11 +1160,26 @@ class MySickle(Sickle):
                     # Cloudflare managed challenge on the direct path (oxjob #1425): it keys on our
                     # datacenter IP + TLS fingerprint, so waiting does not help; switch this endpoint
                     # to Zyte for the rest of the harvest and persist the flag for the next run.
-                    self.fetch_via_zyte = True
-                    self.zyte_adopted = True
-                    if self.on_zyte_adopted:
-                        self.on_zyte_adopted()
-                    self.logger.warning(f"Cloudflare challenge from {self.endpoint}: switching to Zyte")
+                    self._switch_to_zyte(f"Cloudflare challenge from {self.endpoint}: switching to Zyte")
+                    attempt -= 1
+                    continue
+
+                if (zyte_available() and self.http_method == 'GET' and not self.zyte_session_init_url
+                        and is_bot_challenge(http_response)):
+                    # Anubis-style wall (direct, or through Zyte's plain mode, which gets the same page):
+                    # fetch through a Zyte session opened by one browser visit (oxjob #1588). If the
+                    # session still gets the wall, the check below raises and it classifies 'blocked'.
+                    self.zyte_session_init_url = url
+                    self._switch_to_zyte(f"bot challenge page from {self.endpoint}: switching to a Zyte browser session")
+                    attempt -= 1
+                    continue
+
+                if (http_response.status_code == 403 and blocked_attempts >= len(BLOCKED_RETRY_WAITS)
+                        and not self.fetch_via_zyte and zyte_available()
+                        and urlparse(self.endpoint).hostname in ZYTE_AFTER_403_HOSTS):
+                    # Still 403 after the paced retries on a host we'd rather pay to reach than wait on
+                    # (HAL, Jason 2026-10-08, oxjob #1588): go through Zyte's IPs.
+                    self._switch_to_zyte(f"HTTP 403 persists from {self.endpoint}: switching to Zyte")
                     attempt -= 1
                     continue
 
@@ -1158,7 +1237,7 @@ class MySickle(Sickle):
                 if not (response_start.startswith('<?xml') or response_start.startswith('<oai-pmh')):
                     # A bot wall answers 200 with an HTML challenge page (HAL puts Anubis in front of
                     # hal.science, oxjob #1402). Call it blocked, not malformed, so it shows as a block.
-                    if BOT_CHALLENGE_RE.search(http_response.text[:20000]):
+                    if is_bot_challenge(http_response):
                         raise Exception(f"Blocked by a bot challenge page: {http_response.text[:100]}")
                     raise Exception(f"Invalid XML response: {http_response.text[:100]}")
 
