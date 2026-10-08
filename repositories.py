@@ -121,6 +121,7 @@ RETRY_BLOCKED_WORKERS = 0
 ZYTE_API_URL = "https://api.zyte.com/v1/extract"
 ZYTE_TIMEOUT = (15, 120)    # Zyte solves the challenge itself; 17 s seen for a slow host
 BATCH_SIZE = 5000           # Records per S3 file
+BOT_CHALLENGE_RE = re.compile(r"anubis|making sure you(?:'|&#39;|’)re not a bot", re.I)
 # Endpoints whose records must not land under repositories/, which Repo.py reads with a fixed oai_dc
 # schema: each has its own S3 folder and its own walden pipeline. IRDB (jpcoar_2.0) -> IRDB.py; all of
 # HAL in xml-tei -> HalTei.py (oxjob #1588; under repositories/ it would collide with the oai_dc HAL rows,
@@ -1155,6 +1156,10 @@ class MySickle(Sickle):
                 self._strip_invalid_xml_chars(http_response)
                 response_start = http_response.text.strip()[:100].lower()
                 if not (response_start.startswith('<?xml') or response_start.startswith('<oai-pmh')):
+                    # A bot wall answers 200 with an HTML challenge page (HAL puts Anubis in front of
+                    # hal.science, oxjob #1402). Call it blocked, not malformed, so it shows as a block.
+                    if BOT_CHALLENGE_RE.search(http_response.text[:20000]):
+                        raise Exception(f"Blocked by a bot challenge page: {http_response.text[:100]}")
                     raise Exception(f"Invalid XML response: {http_response.text[:100]}")
 
                 if self.encoding:

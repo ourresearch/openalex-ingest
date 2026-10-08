@@ -18,7 +18,7 @@ import argparse
 import logging
 import re
 from datetime import timedelta
-from time import time
+from time import sleep, time
 
 import requests
 
@@ -26,6 +26,8 @@ from common import S3_BUCKET, Session
 from repositories import StateManager, harvest_single_endpoint, parse_date
 
 RETRIES_PER_DAY = 3
+RETRY_WAITS = (60, 300)          # seconds before the 2nd and 3rd attempt of a day
+STOP_AFTER_FAILED_DAYS = 3       # in a row: the feed is blocking or down, so stop instead of failing every day
 
 
 def expected_records(pmh_url, metadata_prefix, start, end):
@@ -58,16 +60,26 @@ def main():
     logger.info(f"BACKFILL {args.endpoint_id} {args.start}..{args.end}: feed says {expected} records")
 
     n_days = (args.end - args.start).days + 1
-    started, total_records, failed = time(), 0, []
+    started, total_records, failed, consecutive_failed = time(), 0, [], 0
     day = args.start
     for i in range(n_days):
         for attempt in range(1, RETRIES_PER_DAY + 1):
             _, status, seconds, error = harvest_single_endpoint(args.endpoint_id, pmh_url, S3_BUCKET, day, day)
             if status in ('success', 'empty'):
+                consecutive_failed = 0
                 break
             logger.warning(f"{day} attempt {attempt} {status}: {(error or '')[:300]}")
+            if attempt < RETRIES_PER_DAY:
+                sleep(RETRY_WAITS[attempt - 1])
         else:
             failed.append(day.isoformat())
+            consecutive_failed += 1
+            if consecutive_failed >= STOP_AFTER_FAILED_DAYS:
+                resume = day - timedelta(days=consecutive_failed - 1)
+                logger.error(f"BACKFILL STOPPED at {day}: {consecutive_failed} days in a row failed (last: {status}: "
+                             f"{(error or '')[:200]}). Resume with --from {resume} --to {args.end}; earlier failed days: "
+                             f"{' '.join(failed[:-consecutive_failed]) or 'none'}")
+                raise SystemExit(1)
         with Session() as session:
             records = StateManager.get_endpoint(args.endpoint_id, session).last_record_count or 0
         total_records += records
