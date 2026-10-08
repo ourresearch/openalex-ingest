@@ -121,6 +121,14 @@ RETRY_BLOCKED_WORKERS = 0
 ZYTE_API_URL = "https://api.zyte.com/v1/extract"
 ZYTE_TIMEOUT = (15, 120)    # Zyte solves the challenge itself; 17 s seen for a slow host
 BATCH_SIZE = 5000           # Records per S3 file
+# Endpoints whose records must not land under repositories/, which Repo.py reads with a fixed oai_dc
+# schema: each has its own S3 folder and its own walden pipeline. IRDB (jpcoar_2.0) -> IRDB.py; all of
+# HAL in xml-tei -> HalTei.py (oxjob #1588; under repositories/ it would collide with the oai_dc HAL rows,
+# same OAI ids and datestamps).
+OWN_S3_FOLDER = {"irdb_nii_ac_jp": "irdb", "hal_tei": "hal-tei"}
+# Smaller S3 batches where records are big: the buffer holds parsed records, and a HAL TEI record is
+# ~26 KB of XML (oxjob #1588).
+BATCH_SIZE_BY_ENDPOINT = {"hal_tei": 1000}
 EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
 # Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
 # (100 threads) finished all ~4,600 endpoints in 2h09m on 2026-09-28 and its slowest endpoint took
@@ -451,7 +459,7 @@ class EndpointHarvester:
 
     def __init__(self, endpoint: Endpoint, db_session, batch_size=BATCH_SIZE):
         self.state = endpoint
-        self.batch_size = batch_size
+        self.batch_size = BATCH_SIZE_BY_ENDPOINT.get(endpoint.id, batch_size)
         self.db = db_session
         self.error = None
         self.metrics = MetricsLogger()
@@ -724,8 +732,8 @@ class EndpointHarvester:
             content_hash = hashlib.md5(
                 ("".join(record_ids) + "".join(record_bodies)).encode()
             ).hexdigest()[:12]
-            if self.state.id == "irdb_nii_ac_jp":
-                object_key = f"irdb/{date_path}/{content_hash}.xml.gz"
+            if self.state.id in OWN_S3_FOLDER:
+                object_key = f"{OWN_S3_FOLDER[self.state.id]}/{date_path}/{content_hash}.xml.gz"
             else:
                 object_key = f"repositories/{self.state.id}/{date_path}/{content_hash}.xml.gz"
 
