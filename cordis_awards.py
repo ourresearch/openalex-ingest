@@ -1,8 +1,7 @@
-"""CORDIS bulk programmes, monthly; mapping ported from Walden origin.
+"""CORDIS monthly bulk fetch; origin mapping with current per-project JSON adapter.
 
-The current JSON ZIP contains per-project documents, not the origin's flat
-project/organization arrays. CSV ZIPs expose those original fields; decimal
-commas are converted before applying the unchanged output mapping.
+Preserve objective whitespace and structured identifiers. The CSV export is
+not interchangeable: it removes line breaks and can shift quoted fields.
 """
 from datetime import datetime
 from pathlib import Path
@@ -11,25 +10,24 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from award_fetch import download, http_session, run, check_disk
-import csv
-import io
+import re
 import zipfile
 from award_schemas import CORDIS_SCHEMA
 
 CORDIS_DATASETS = {
     "horizon_europe": {
         "name": "Horizon Europe (2021-2027)",
-        "projects_url": "https://cordis.europa.eu/data/cordis-HORIZONprojects-csv.zip",
+        "projects_url": "https://cordis.europa.eu/data/cordis-HORIZONprojects-json.zip",
         "framework": "HORIZON",
     },
     "h2020": {
         "name": "Horizon 2020 (2014-2020)",
-        "projects_url": "https://cordis.europa.eu/data/cordis-h2020projects-csv.zip",
+        "projects_url": "https://cordis.europa.eu/data/cordis-h2020projects-json.zip",
         "framework": "H2020",
     },
     "fp7": {
         "name": "FP7 (2007-2013)",
-        "projects_url": "https://cordis.europa.eu/data/cordis-fp7projects-csv.zip",
+        "projects_url": "https://cordis.europa.eu/data/cordis-fp7projects-json.zip",
         "framework": "FP7",
     },
 }
@@ -153,7 +151,7 @@ def process_dataframe(df: pd.DataFrame, output_dir: Path) -> Path:
     numeric_columns = ["total_cost", "ec_max_contribution", "coordinator_ec_contribution"]
     for col in numeric_columns:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col].astype("string").str.replace(",", ".", regex=False), errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Ensure string columns are properly typed (avoid mixed types)
     print("  Cleaning string columns...")
@@ -216,6 +214,69 @@ def process_dataframe(df: pd.DataFrame, output_dir: Path) -> Path:
 
     return output_path
 
+def flatten_project(document):
+    """Adapt CORDIS's current per-project JSON to the origin's flat inputs."""
+    if document.get("contenttype") != "project" or not document.get("id"):
+        raise ValueError("Not a CORDIS project document")
+    # The old flat export represented missing scalar values as empty strings.
+    project = {key: document.get(key, "") for key in (
+        "id", "acronym", "rcn", "title", "objective", "status", "keywords",
+        "startDate", "endDate", "ecSignatureDate", "totalCost",
+        "ecMaxContribution", "contentUpdateDate")}
+    project["grantDoi"] = document.get("identifiers", {}).get("grantDoi", "")
+    relations = document.get("relations", {})
+    associations = relations.get("associations", [])
+    categories = relations.get("categories", [])
+    def codes(items, attribute, value, field):
+        values = [item.get(field, "").lstrip("/") for item in items
+                  if item.get("attributes", {}).get(attribute) == value]
+        return ";".join(value for value in values if value)
+    project["fundingScheme"] = codes(categories, "classification", "projectFundingSchemeCategory", "code")
+    project["topics"] = codes(associations, "type", "relatedTopic", "code")
+    project["legalBasis"] = codes(associations, "type", "relatedLegalBasis", "code")
+    project["masterCall"] = codes(associations, "type", "relatedMasterCall", "identifier")
+    project["subCall"] = codes(associations, "type", "relatedSubCall", "identifier")
+    organizations = []
+    for org in associations:
+        attrs = org.get("attributes", {})
+        if org.get("contenttype") != "organization" or attrs.get("type") != "coordinator":
+            continue
+        address = org.get("address", {})
+        organizations.append({
+            "projectID": project["id"], "role": "coordinator",
+            "name": org.get("legalName", ""), "shortName": org.get("shortName", ""),
+            "country": address.get("country", ""), "city": address.get("city", ""),
+            "organisationID": org.get("id", ""), "ecContribution": attrs.get("ecContribution", ""),
+            "activityType": codes(org.get("relations", {}).get("categories", []),
+                                  "classification", "organizationActivityType", "code"),
+        })
+    return project, organizations
+
+
+def read_programme(archive, framework):
+    members = archive.namelist()
+    projects = [n for n in members if Path(n).name.lower() == "project.json"]
+    organizations = [n for n in members if Path(n).name.lower() == "organization.json"]
+    if len(projects) == len(organizations) == 1:
+        with archive.open(projects[0]) as handle:
+            records = json.load(handle)
+        with archive.open(organizations[0]) as handle:
+            orgs = json.load(handle)
+        if not records or not orgs:
+            raise ValueError("Empty CORDIS flat export")
+        return process_projects(records, orgs, framework)
+    documents = [n for n in members if re.fullmatch(r"project-rcn-\d+_en\.json", Path(n).name)]
+    if not documents:
+        raise ValueError("No CORDIS project records in archive")
+    rows = []
+    for name in documents:
+        with archive.open(name) as handle:
+            document = json.load(handle)
+        project, orgs = flatten_project(document)
+        rows.extend(process_projects([project], orgs, framework))
+    return rows
+
+
 def build(directory):
     output = directory / "cordis.parquet"
     seen = set()
@@ -225,25 +286,9 @@ def build(directory):
             raw = directory / "programme.zip"
             download(session, info["projects_url"], raw)
             with zipfile.ZipFile(raw) as archive:
-                members = archive.namelist()
-                print(f"CORDIS {name} archive: {len(members)} members", flush=True)
-                def member(wanted):
-                    matches = [n for n in members if Path(n).name.lower() == wanted]
-                    if len(matches) != 1:
-                        raise ValueError(f"Expected one {wanted}, found {matches}")
-                    return matches[0]
-                def read_csv(wanted, required):
-                    with archive.open(member(wanted)) as handle:
-                        reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8-sig"), delimiter=";")
-                        if not required <= set(reader.fieldnames or []):
-                            raise ValueError(f"Missing CORDIS fields in {wanted}")
-                        return [{k: v if v != "" else None for k, v in row.items()} for row in reader]
-                projects = read_csv("project.csv", {"id", "title", "objective", "fundingScheme",
-                    "startDate", "endDate", "ecMaxContribution"})
-                organizations = read_csv("organization.csv", {"projectID", "role", "name", "country"})
-            if not projects or not organizations:
-                raise ValueError(f"Empty programme or organizations: {name}")
-            rows = process_projects(projects, organizations, info["framework"])
+                rows = read_programme(archive, info["framework"])
+            if not rows:
+                raise ValueError(f"Empty programme: {name}")
             frame = pd.DataFrame(rows)
             if frame.cordis_project_id.isna().any() or frame.cordis_project_id.astype(str).str.strip().eq("").any():
                 raise ValueError("Invalid CORDIS project key")

@@ -80,7 +80,8 @@ Register an application ID at https://support.nii.ac.jp/en/cinii/api/developer.
 
 CORDIS downloads all three programmes, one ZIP at a time; any failed programme aborts.
 The current JSON ZIP has per-project documents rather than the origin's flat arrays.
-The CSV ZIPs preserve the origin field names and coordinator join; decimal commas are parsed.
+A JSON adapter restores the flat inputs, including nested grant DOI, scheme and coordinator.
+JSON preserves objective line breaks; the CSV alternative failed a fresh-file content check.
 Origin programme order, first-ID deduplication, date conversions and output mapping are retained.
 Each raw ZIP is removed after its programme has been written to parquet.
 Gates retains the origin date/duration/amount conversion and first-ID deduplication.

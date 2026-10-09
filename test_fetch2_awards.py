@@ -37,8 +37,10 @@ class Fetch2Tests(unittest.TestCase):
     def test_cordis_all_programmes_nested_members_and_cleanup(self):
         def download(session, url, path):
             with zipfile.ZipFile(path, 'w') as z:
-                z.writestr('data/Project.csv', 'id;title;objective;fundingScheme;startDate;endDate;ecMaxContribution;totalCost\n123;Research;Purpose;RIA;2025-01-01;2026-01-01;10,5;10,5\n')
-                z.writestr('data/Organization.csv', 'projectID;role;name;country\n123;coordinator;University;DE\n')
+                z.writestr('data/Project.json', json.dumps([{'id': '123', 'title': 'Research',
+                    'totalCost': '10.5', 'startDate': '2025-01-01'}]))
+                z.writestr('data/Organization.json', json.dumps([{'projectID': '123',
+                    'role': 'coordinator', 'name': 'University'}]))
         with tempfile.TemporaryDirectory() as tmp, patch.object(cordis, 'download', download):
             out = cordis.build(Path(tmp))
             t = pq.read_table(out)
@@ -51,6 +53,26 @@ class Fetch2Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(cordis, 'download', side_effect=ValueError('missing programme')):
             with self.assertRaises(ValueError):
                 cordis.build(Path(tmp))
+
+    def test_cordis_structured_json_preserves_text_and_identifiers(self):
+        doc = {"contenttype": "project", "id": "123", "objective": 'First; "quoted"\nSecond',
+               "identifiers": {"grantDoi": "10.3030/123"}, "relations": {
+                   "categories": [{"code": "/HORIZON-RIA", "attributes": {"classification": "projectFundingSchemeCategory"}}],
+                   "associations": [{"contenttype": "organization", "id": "999", "legalName": "University",
+                     "attributes": {"type": "coordinator", "ecContribution": "10.5"},
+                     "address": {"country": "DE", "city": "Berlin"}}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"data.zip"
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("project-rcn-1_en.json", json.dumps(doc))
+            with zipfile.ZipFile(path) as z:
+                row = cordis.read_programme(z, "HORIZON")[0]
+            self.assertEqual(row["objective"], doc["objective"])
+            self.assertEqual(row["grant_doi"], "10.3030/123")
+            self.assertEqual(row["funding_scheme"], "HORIZON-RIA")
+            self.assertEqual(row["coordinator_name"], "University")
+            self.assertEqual(row["coordinator_country"], "DE")
+            self.assertEqual(row["keywords"], "")
 
     def test_gates_blank_footer_and_contract(self):
         cols=['GRANT ID','GRANTEE','PURPOSE','DIVISION','DATE COMMITTED','DURATION (MONTHS)',
