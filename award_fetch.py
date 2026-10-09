@@ -33,6 +33,11 @@ def http_session():
     return session
 
 
+def check_disk(directory):
+    if shutil.disk_usage(directory).free < 512 * 1024 ** 2:
+        raise OSError("Disk reserve below 512 MiB")
+
+
 def download(session, url, path, expected_size=None):
     # Retry interrupted bodies from byte zero; never reuse a partial download.
     for attempt in range(3):
@@ -90,7 +95,7 @@ def previous_rows(s3, bucket, prefix):
 def run(source, build, schema):
     parser = argparse.ArgumentParser(description=f"Fetch {source} awards into the dev S3 prefix")
     parser.add_argument("--scheduled", action="store_true",
-                        help="Daily Scheduler entry: run Monday (NSF) or day 1 (Wellcome), UTC")
+                        help="Daily Scheduler entry: run Monday (NSF) or day 1 (other awards), UTC")
     args = parser.parse_args()
     now = datetime.now(timezone.utc)
     bucket, key = destination(source, now)  # Reject unsafe config before any I/O.
@@ -99,7 +104,9 @@ def run(source, build, schema):
         return
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix=f"awards-{source}-") as workdir:
+        check_disk(workdir)
         path = build(Path(workdir))
+        check_disk(workdir)
         parquet = pq.ParquetFile(path)
         rows = parquet.metadata.num_rows
         if not rows or not parquet.schema_arrow.equals(schema, check_metadata=False):

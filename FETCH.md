@@ -66,3 +66,29 @@ NSF dev: s3://openalex-ingest/awards/dev-gr1009/nsf/2026-10-09.parquet
 Both production objects retain their measured size and LastModified.
 No award temp directories, raw downloads or local parquet outputs remain.
 Initial df -h showed 19 GiB free; concurrent machine use varied during the run.
+
+Batch 1 completion: CORDIS, Gates and KAKEN.
+Run: python -m cordis_awards; python -m gates_awards; python -m kaken_awards.
+Each accepts --scheduled and runs only on UTC day 1; manual runs bypass the calendar.
+Origin scripts specify no other recurring cadence. No Scheduler entry was created.
+EUROPEAN_COMMISSION_AWARDS_S3_PREFIX, GATES_AWARDS_S3_PREFIX and KAKEN_AWARDS_S3_PREFIX
+accept only s3://openalex-ingest/awards/dev-gr1009/{european_commission,gates,kaken}/ respectively.
+The shared harness dates object names YYYY-MM-DD.parquet and verifies the upload.
+KAKEN requires KAKEN_APPID in the process environment before any HTTP request.
+No local .env auto-loading, credential logging, HTML scraping, registry or Databricks access.
+Register an application ID at https://support.nii.ac.jp/en/cinii/api/developer.
+
+CORDIS downloads all three programmes, one ZIP at a time; any failed programme aborts.
+The current JSON ZIP has per-project documents rather than the origin's flat arrays.
+The CSV ZIPs preserve the origin field names and coordinator join; decimal commas are parsed.
+Origin programme order, first-ID deduplication, date conversions and output mapping are retained.
+Each raw ZIP is removed after its programme has been written to parquet.
+Gates retains the origin date/duration/amount conversion and first-ID deduplication.
+All-empty CSV records are omitted; populated rows without grant IDs fail.
+KAKEN retains the origin EN/JA overlay, fiscal-year paging and first-ID deduplication.
+Each XML page is streamed, checked against totalResults, written to parquet, then removed.
+Missing totals, malformed records, short/repeated pages or changing totals abort.
+KAKEN output is the measured production 17-column schema.
+Six API-only fields are deliberately omitted: amount_direct, amount_indirect, project_type,
+project_status, institution_nii_code, members_json. No SQL migration is needed.
+These three production schemas are frozen in award_schemas.py.
