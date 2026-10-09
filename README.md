@@ -98,3 +98,8 @@ MAX_PER_HOST = 3        # Max concurrent requests per host
 REQUEST_TIMEOUT = 30    # Connect timeout; READ_TIMEOUT = 60 for the body
 BATCH_SIZE = 5000       # Records per S3 file
 ```
+
+## Award fetchers
+
+`python -m nsf_awards` and `python -m wellcome_awards` write dated parquet snapshots to the grants dev prefixes.
+See [FETCH.md](FETCH.md) for configuration, scheduling, validation and Casey's deployment steps.
