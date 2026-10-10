@@ -135,6 +135,10 @@ OWN_S3_FOLDER = {"irdb_nii_ac_jp": "irdb", "hal_tei": "hal-tei"}
 # Smaller S3 batches where records are big: the buffer holds parsed records, and a HAL TEI record is
 # ~26 KB of XML (oxjob #1588).
 BATCH_SIZE_BY_ENDPOINT = {"hal_tei": 1000}
+# Also start a new S3 file once a batch holds this much XML. HAL re-stamped ~400 big-collaboration papers
+# (~4,770 authors, 1.56 MB of TEI each) on 2026-09-13: 1,000 of them would be a ~1.5 GB file, more than
+# HalTei.py's parser UDF can return as one value (oxjob #1588, 2026-10-10).
+BATCH_BYTES_BY_ENDPOINT = {"hal_tei": 32_000_000}
 EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
 # Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
 # (100 threads) finished all ~4,600 endpoints in 2h09m on 2026-09-28 and its slowest endpoint took
@@ -466,6 +470,7 @@ class EndpointHarvester:
     def __init__(self, endpoint: Endpoint, db_session, batch_size=BATCH_SIZE):
         self.state = endpoint
         self.batch_size = BATCH_SIZE_BY_ENDPOINT.get(endpoint.id, batch_size)
+        self.batch_bytes = BATCH_BYTES_BY_ENDPOINT.get(endpoint.id)
         self.db = db_session
         self.error = None
         self.metrics = MetricsLogger()
@@ -580,6 +585,7 @@ class EndpointHarvester:
 
             # Group records by date
             records_by_date = {}
+            bytes_by_date = {}
             batch_counters = {}
             current_date_processing = None
             records_saved = 0
@@ -613,6 +619,7 @@ class EndpointHarvester:
                     # don't grow unbounded for endpoints walking through
                     # years of historical dates.
                     records_by_date.pop(current_date_processing, None)
+                    bytes_by_date.pop(current_date_processing, None)
                     batch_counters.pop(current_date_processing, None)
 
                     checkpoint_dt = parse_datestamp(current_date_processing)
@@ -626,15 +633,20 @@ class EndpointHarvester:
 
                 if date_key not in records_by_date:
                     records_by_date[date_key] = []
+                    bytes_by_date[date_key] = 0
                     batch_counters[date_key] = 1
 
                 records_by_date[date_key].append(record)
+                if self.batch_bytes:
+                    bytes_by_date[date_key] += len(record.raw)
 
-                if len(records_by_date[date_key]) >= self.batch_size:
+                if (len(records_by_date[date_key]) >= self.batch_size
+                        or (self.batch_bytes and bytes_by_date[date_key] >= self.batch_bytes)):
                     records_saved += len(records_by_date[date_key])
                     self.save_batch(s3_client, s3_bucket, batch_counters[date_key],
                                     records_by_date[date_key], date_key)
                     records_by_date[date_key] = []
+                    bytes_by_date[date_key] = 0
                     batch_counters[date_key] += 1
 
                 # Checked after the record is buffered, so it is counted and saved. Raised inside
