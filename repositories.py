@@ -58,6 +58,7 @@ import gc
 import gzip
 import hashlib
 import logging
+import math
 import os
 import re
 import threading
@@ -139,6 +140,11 @@ BATCH_SIZE_BY_ENDPOINT = {"hal_tei": 1000}
 # (~4,770 authors, 1.56 MB of TEI each) on 2026-09-13: 1,000 of them would be a ~1.5 GB file, more than
 # HalTei.py's parser UDF can return as one value (oxjob #1588, 2026-10-10).
 BATCH_BYTES_BY_ENDPOINT = {"hal_tei": 32_000_000}
+# A single record bigger than this is pathological: it goes to oversize/<endpoint id>/YYYY/MM/DD/ on its own,
+# never into the endpoint's normal files, and is logged and counted (Jason, 2026-10-10, oxjob #1588). The
+# biggest HAL TEI record seen is 1.56 MB.
+MAX_RECORD_BYTES_BY_ENDPOINT = {"hal_tei": 16_000_000}
+OVERSIZE_S3_FOLDER = "oversize"
 EMPTY_FIRST_HARVEST_MSG = "First harvest (no 'from') returned no records"
 # Wall-clock cap on one FIRST harvest (no checkpoint, whole feed). The daily --all-endpoints run
 # (100 threads) finished all ~4,600 endpoints in 2h09m on 2026-09-28 and its slowest endpoint took
@@ -470,7 +476,10 @@ class EndpointHarvester:
     def __init__(self, endpoint: Endpoint, db_session, batch_size=BATCH_SIZE):
         self.state = endpoint
         self.batch_size = BATCH_SIZE_BY_ENDPOINT.get(endpoint.id, batch_size)
-        self.batch_bytes = BATCH_BYTES_BY_ENDPOINT.get(endpoint.id)
+        self.batch_bytes = BATCH_BYTES_BY_ENDPOINT.get(endpoint.id, math.inf)
+        self.max_record_bytes = MAX_RECORD_BYTES_BY_ENDPOINT.get(endpoint.id, math.inf)
+        # sickle's record.raw re-serializes the record on every read: measure only where a cap is set
+        self.measure_bytes = endpoint.id in BATCH_BYTES_BY_ENDPOINT or endpoint.id in MAX_RECORD_BYTES_BY_ENDPOINT
         self.db = db_session
         self.error = None
         self.metrics = MetricsLogger()
@@ -589,6 +598,7 @@ class EndpointHarvester:
             batch_counters = {}
             current_date_processing = None
             records_saved = 0
+            records_set_aside = 0
 
             for record in self._iter_records_safe(records):
                 self.metrics.increment_count()
@@ -636,12 +646,19 @@ class EndpointHarvester:
                     bytes_by_date[date_key] = 0
                     batch_counters[date_key] = 1
 
-                records_by_date[date_key].append(record)
-                if self.batch_bytes:
-                    bytes_by_date[date_key] += len(record.raw)
+                record_bytes = len(record.raw) if self.measure_bytes else 0
+                if record_bytes > self.max_record_bytes:
+                    self.save_batch(s3_client, s3_bucket, 1, [record], date_key,
+                                    folder=f"{OVERSIZE_S3_FOLDER}/{self.state.id}")
+                    self.logger.warning(f"Oversize record {record.header.identifier} ({record_bytes:,} bytes of XML) "
+                                        f"set aside under {OVERSIZE_S3_FOLDER}/{self.state.id}/")
+                    records_set_aside += 1
+                    continue
 
-                if (len(records_by_date[date_key]) >= self.batch_size
-                        or (self.batch_bytes and bytes_by_date[date_key] >= self.batch_bytes)):
+                records_by_date[date_key].append(record)
+                bytes_by_date[date_key] += record_bytes
+
+                if len(records_by_date[date_key]) >= self.batch_size or bytes_by_date[date_key] >= self.batch_bytes:
                     records_saved += len(records_by_date[date_key])
                     self.save_batch(s3_client, s3_bucket, batch_counters[date_key],
                                     records_by_date[date_key], date_key)
@@ -668,14 +685,21 @@ class EndpointHarvester:
             # Reconcile: record_count counts records ITERATED, which is what made the drop
             # above invisible for as long as it existed. Compare against what we actually
             # wrote, and against the feed's own completeListSize when it gave us one.
-            if records_saved != self.metrics.record_count:
+            # Set-aside records are stored (under oversize/), so they count as accounted for, not lost.
+            accounted = records_saved + records_set_aside
+            if records_set_aside:
                 self.logger.warning(
-                    f"Record loss: iterated {self.metrics.record_count}, saved {records_saved} "
-                    f"({self.metrics.record_count - records_saved} unsaved) for {self.state.pmh_url}")
-            if self.metrics.total_records and records_saved < self.metrics.total_records:
+                    f"Oversize: set aside {records_set_aside} of {self.metrics.record_count} records "
+                    f"(> {self.max_record_bytes:,} bytes of XML each) under "
+                    f"s3://{s3_bucket}/{OVERSIZE_S3_FOLDER}/{self.state.id}/ for {self.state.pmh_url}")
+            if accounted != self.metrics.record_count:
+                self.logger.warning(
+                    f"Record loss: iterated {self.metrics.record_count}, saved {records_saved}, set aside "
+                    f"{records_set_aside} ({self.metrics.record_count - accounted} unsaved) for {self.state.pmh_url}")
+            if self.metrics.total_records and accounted < self.metrics.total_records:
                 self.logger.warning(
                     f"Short harvest: feed advertised {self.metrics.total_records}, "
-                    f"saved {records_saved} for {self.state.pmh_url}")
+                    f"saved {records_saved} + set aside {records_set_aside} for {self.state.pmh_url}")
 
             # First harvest: the walk completed, so the max datestamp seen is safe.
             final_date = max_date_key if first_harvest else current_date_processing
@@ -733,8 +757,8 @@ class EndpointHarvester:
         after=tenacity.after_log(LOGGER, logging.INFO),
         reraise=True
     )
-    def save_batch(self, s3_client, s3_bucket, batch_number, records, date_key):
-        """Save a batch of records to S3."""
+    def save_batch(self, s3_client, s3_bucket, batch_number, records, date_key, folder=None):
+        """Save a batch of records to S3, under the endpoint's folder unless `folder` is given."""
         try:
             date_path = self.get_datetime_path(date_key)
 
@@ -750,10 +774,9 @@ class EndpointHarvester:
             content_hash = hashlib.md5(
                 ("".join(record_ids) + "".join(record_bodies)).encode()
             ).hexdigest()[:12]
-            if self.state.id in OWN_S3_FOLDER:
-                object_key = f"{OWN_S3_FOLDER[self.state.id]}/{date_path}/{content_hash}.xml.gz"
-            else:
-                object_key = f"repositories/{self.state.id}/{date_path}/{content_hash}.xml.gz"
+            if folder is None:
+                folder = OWN_S3_FOLDER.get(self.state.id, f"repositories/{self.state.id}")
+            object_key = f"{folder}/{date_path}/{content_hash}.xml.gz"
 
             try:
                 s3_client.head_object(Bucket=s3_bucket, Key=object_key)
