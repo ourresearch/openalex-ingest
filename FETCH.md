@@ -30,19 +30,24 @@ Uploads use boto3 single PUT; HEAD verifies bytes and SHA256 metadata.
 Temporary raw and parquet files are removed on completion or failure.
 Download guards require 1 GiB reserve initially and stop below 512 MiB.
 
-Schedule NSF: daily Heroku Scheduler entry python -m nsf_awards --scheduled at 20:00 UTC.
-That entry performs the full fetch on Mondays only; other days exit before I/O.
-Schedule Wellcome: daily entry python -m wellcome_awards --scheduled at 20:00 UTC.
-That entry performs the full fetch on UTC day 1 only; other days exit before I/O.
-Manual commands without --scheduled run immediately for a missed run or retry.
-Casey: review and take this local commit into his deployment checkout.
-Casey: deploy it through his existing openalex-ingest Heroku release flow.
+Owner: Rohan (writes, deploys, watches failures). Casey and Jason get an FYI.
+Deploy: push to openalex-ingest main; Heroku auto-deploys. Confirm `heroku releases -a openalex-ingest` shows the new commit before any run.
 Dependencies add openpyxl==3.1.5; existing boto3, pandas, pyarrow, requests and lxml are reused.
-Casey: configure AWS credentials limited to the two dev prefixes and set the env vars above.
-Casey: add the two Scheduler entries and monitor nonzero exits and JSON completion logs.
-No Procfile change or database migration is needed.
+No Procfile change, release phase or database migration.
+Schedule (Advanced Scheduler add-on, cron, UTC):
+  NSF:      `0 20 * * 1`  python -m nsf_awards --scheduled   (full fetch Mondays)
+  Wellcome: `0 20 1 * *`  python -m wellcome_awards --scheduled   (full fetch on day 1)
+Manual commands without --scheduled run immediately for a missed run or retry.
+Failures exit nonzero with a JSON log line; Rohan watches them.
+Uploads are refused unless the prefix is exactly s3://openalex-ingest/awards/dev-gr1009/{nsf,wellcome}/ (checked in code before any I/O).
+Each Awards run reads the newest snapshot only; prune old dev snapshots before the Awards job is unpaused.
 Production promotion requires a separately approved prefix-guard change and DESIGN rollout gates.
-No pushes, Heroku commands, production writes, or messages were performed here.
+
+Rollback:
+  1. Delete the two Advanced Scheduler entries.
+  2. `heroku rollback <previous release> -a openalex-ingest` (the release before this push).
+  3. `git revert` the award-fetcher commits on main (no force-push).
+  4. If needed, delete objects under s3://openalex-ingest/awards/dev-gr1009/{nsf,wellcome}/.
 
 Wellcome run: 26,288 rows; 19,818,446 bytes; 16.434 seconds.
 Wellcome prod: 19,618 rows; 15,277,282 bytes; modified 2026-07-31T13:57:33Z.
@@ -56,7 +61,7 @@ Live downloads ran on Python 3.9.6, boto3 1.20.33, PyArrow 14.0.2.
 Heroku runtime.txt specifies Python 3.10.8; no Heroku execution was attempted.
 Both --scheduled commands correctly skipped 2026-10-09 without I/O.
 The repeat-run shrink guard was added after the first live runs started and tested offline plus read-only against both new dev objects.
-Evidence lives beside this clone in ../fetch: run logs, prod metadata, dev verification, query log and SHA256SUMS.
+Evidence (run logs, prod metadata, dev verification, query log, checksums) is kept outside the repo.
 
 NSF run: 651,053 rows; 589,627,277 bytes; 558.434 seconds.
 NSF prod: 644,453 rows; 571,953,499 bytes; modified 2026-01-08T20:38:54+00:00.
