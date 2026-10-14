@@ -7,7 +7,45 @@
 irdb.nii.ac.jp
 
 # Zendesk tickets naming the old IP, outside #1560 (oxjob #1604 evidence/zendesk_tickets_naming_old_ips.csv)
-#TICKETS#
+# 5789 dadun.unav.edu (asked, no reply)
+dadun.unav.edu
+# 8738 Plymouth PEARL (allowlisted .255, 2026-08-27)
+pearl.plymouth.ac.uk
+# 8794 / 24839 Otago (Alma; .255, then .139 2026-09-30)
+otago.alma.exlibrisgroup.com
+# 9155 NIE Singapore (item pages / bitstreams)
+repository.nie.edu.sg
+# 23262 DSpaceDirect (Lyrasis firewall for all hosted repos; hosts named in the ticket + registry hosts that CNAME to *.dspacedirect.org)
+dspacedirect.org
+repository.rice.edu
+scholarlycommons.augusta.edu
+repository.uncw.edu
+repository.newmanu.edu
+aura.alfred.edu
+digitallibrary.amnh.org
+# 24000 SCU (Alma)
+scu.alma.exlibrisgroup.com
+# 24099 / 24840 UPF (.255 2026-09-15, .139 2026-10-07)
+repositori-api.upf.edu
+# 24594 NTU (DR-NTU allowlisted .255 2026-10-13)
+dr.ntu.edu.sg
+researchdata.ntu.edu.sg
+# 24617 Murdoch (Alma; .255 2026-09-29)
+murdoch.alma.exlibrisgroup.com
+# 24836 Greater Manchester (Alma eu04, shared regional host; both IPs 2026-10-01)
+eu04.alma.exlibrisgroup.com
+# 24837 eScholarship / CDL (asked how; both IPs sent)
+escholarship.org
+# 24838 Cambridge Apollo (both IPs sent)
+api.repository.cam.ac.uk
+# 24919 Banco de la República (Radware; both IPs sent)
+repositorio.banrep.gov.co
+# 25643 UNESUM (CSF/ModSecurity allowlist .255)
+revistas.unesum.edu.ec
+# 25749 Batman University (asked)
+earsiv.batman.edu.tr
+# Alma serves OAI only to allowlisted IPs; any Alma customer may have allowlisted the old IP outside Zendesk
+alma.exlibrisgroup.com
 
 # oxjob #1425 allowlist targets (40 not already in #1560)
 aisthema.eu
