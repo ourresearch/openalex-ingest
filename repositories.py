@@ -1410,15 +1410,40 @@ def _tls_tolerant_request(method, url, **kwargs):
         return getattr(_tls_fallback_session(url), method)(url, **kwargs)
 
 
+_LEGACY_EGRESS_HOSTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'legacy_egress_hosts.txt')
+_legacy_egress_hosts = None
+
+
+def _uses_legacy_egress(url):
+    """True if this host was given QuotaGuard's IP and stays on it until the retire date (oxjob #1604).
+    An entry matches the host and its subdomains."""
+    global _legacy_egress_hosts
+    if _legacy_egress_hosts is None:
+        try:
+            with open(_LEGACY_EGRESS_HOSTS_FILE) as f:
+                _legacy_egress_hosts = frozenset(
+                    line.split('#')[0].strip().lower() for line in f if line.split('#')[0].strip())
+        except FileNotFoundError:
+            _legacy_egress_hosts = frozenset()
+    host = (urlparse(url).hostname or '').lower()
+    parts = host.split('.')
+    return any('.'.join(parts[i:]) in _legacy_egress_hosts for i in range(len(parts) - 1))
+
+
 def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=(REQUEST_TIMEOUT, READ_TIMEOUT),
                    fetch_via_zyte=False, on_zyte_adopted=None):
     """Create a customized Sickle client for the given URL."""
     if not repo_pmh_url:
         return None
 
-    # Route all harvests through our static egress IP so repositories see the address they
-    # allowlisted. STATIC_IP_PROXY (our own proxy, oxjob #1604) wins over the QuotaGuard add-on.
-    proxy_url = os.getenv("STATIC_IP_PROXY") or os.getenv("QUOTAGUARDSTATIC_URL")
+    # Route all harvests through a static egress IP so repositories see the address they
+    # allowlisted. STATIC_IP_PROXY (our own proxy, oxjob #1604) wins over the QuotaGuard add-on,
+    # except for hosts we gave QuotaGuard's IP to, until they've added ours.
+    legacy_proxy_url = os.getenv("QUOTAGUARDSTATIC_URL")
+    if legacy_proxy_url and _uses_legacy_egress(repo_pmh_url):
+        proxy_url = legacy_proxy_url
+    else:
+        proxy_url = os.getenv("STATIC_IP_PROXY") or legacy_proxy_url
     if not proxy_url:
         LOGGER.error("No STATIC_IP_PROXY or QUOTAGUARDSTATIC_URL: harvesting from the dyno's own IP, "
                      "so IP allowlists will not match")
