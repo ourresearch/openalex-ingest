@@ -1314,7 +1314,26 @@ _tls_fallback_sessions = {}
 _tls_fallback_lock = threading.Lock()
 
 
-class _ContextAdapter(HTTPAdapter):
+class _ProxyVerifyingAdapter(HTTPAdapter):
+    """requests verifies an https:// proxy's certificate only for https:// targets; for http://
+    targets it connects to the proxy with CERT_NONE, so a man in the middle could read the proxy
+    password. Verify the proxy for those too (oxjob #1604)."""
+
+    def cert_verify(self, conn, url, verify, cert):
+        super().cert_verify(conn, url, verify, cert)
+        if not url.lower().startswith('https') and getattr(conn, 'scheme', None) == 'https':
+            conn.cert_reqs = 'CERT_REQUIRED'
+            conn.ca_certs = certifi.where()
+
+
+def _proxy_verifying_session():
+    session = requests.Session()
+    session.mount('http://', _ProxyVerifyingAdapter())
+    session.mount('https://', _ProxyVerifyingAdapter())
+    return session
+
+
+class _ContextAdapter(_ProxyVerifyingAdapter):
     def __init__(self, ssl_context, **kwargs):
         self._ssl_context = ssl_context
         super().__init__(**kwargs)
@@ -1370,7 +1389,7 @@ def _tls_fallback_session(url):
     ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
     for pem in _aia_intermediates_pem(host):
         ctx.load_verify_locations(cadata=pem)
-    session = requests.Session()
+    session = _proxy_verifying_session()
     adapter = _ContextAdapter(ctx)
     session.mount('https://', adapter)
     with _tls_fallback_lock:
@@ -1381,7 +1400,9 @@ def _tls_fallback_session(url):
 def _tls_tolerant_request(method, url, **kwargs):
     """requests.get/post; on SSLError retry once through a per-host compatibility session."""
     try:
-        return getattr(requests, method)(url, **kwargs)
+        # a fresh session per call, like requests.get/post, so no cookies carry across hosts
+        with _proxy_verifying_session() as session:
+            return getattr(session, method)(url, **kwargs)
     except requests.exceptions.SSLError as e:
         # also covers an http URL redirected to an https host with a broken chain: the
         # fallback session follows the redirect with its https adapter
@@ -1395,10 +1416,12 @@ def _get_my_sickle(repo_pmh_url, metrics_logger=None, timeout=(REQUEST_TIMEOUT, 
     if not repo_pmh_url:
         return None
 
-    # Route all harvests through the QuotaGuard static IP so repositories see
-    # a consistent source address (previously only citeseerx, pure.coventry,
-    # and irdb.nii.ac.jp were proxied).
-    proxy_url = os.getenv("QUOTAGUARDSTATIC_URL") or os.getenv("STATIC_IP_PROXY")
+    # Route all harvests through our static egress IP so repositories see the address they
+    # allowlisted. STATIC_IP_PROXY (our own proxy, oxjob #1604) wins over the QuotaGuard add-on.
+    proxy_url = os.getenv("STATIC_IP_PROXY") or os.getenv("QUOTAGUARDSTATIC_URL")
+    if not proxy_url:
+        LOGGER.error("No STATIC_IP_PROXY or QUOTAGUARDSTATIC_URL: harvesting from the dyno's own IP, "
+                     "so IP allowlists will not match")
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else {}
     iterator = OSTIItemIterator if 'osti.gov/oai' in repo_pmh_url else MyOAIItemIterator
     sickle = MySickle(repo_pmh_url, proxies=proxies, timeout=timeout, iterator=iterator,
