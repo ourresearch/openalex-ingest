@@ -716,3 +716,21 @@ voltignix.com
 wastu.unmerbaya.ac.id
 wikep.net
 yurisdiksi.unmerbaya.ac.id
+
+# Refuse or drop 44.208.99.237 but answer 18.213.181.255 (first run on the new IP, 2026-10-15; Identify via both
+# routes, checked twice). Not told about any IP: a firewall default or a rate ban. Ask, or retest, before the retire date.
+api.archives-ouvertes.fr
+dugifonsespecials.udg.edu
+edoc.bbaw.de
+eprints.vu.edu.au
+journal.isi-padangpanjang.ac.id
+jstatsoft.org
+jurnal.ugm.ac.id
+opus.bibliothek.uni-wuerzburg.de
+opus4.kobv.de
+publishup.uni-potsdam.de
+revistas.inah.gob.mx
+revistas.unilasalle.edu.br
+tesjournal.com
+vuir.vu.edu.au
+www.metodosdeinformacion.es
