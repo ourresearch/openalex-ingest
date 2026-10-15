@@ -6,6 +6,7 @@ pandas==2.2.3
 psycopg2==2.9.10
 pyarrow==17.0.0
 requests==2.32.3
+sentry-sdk==2.71.0
 shortuuid==1.0.13
 sickle~=0.7.0
 sqlalchemy==2.0.36

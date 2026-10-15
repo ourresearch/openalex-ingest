@@ -9,6 +9,10 @@ import boto3
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from sentry_setup import init_sentry
+
+init_sentry()   # oxjob #1685
+
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger("datacite_harvester")
 

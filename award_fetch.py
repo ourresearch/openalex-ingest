@@ -2,6 +2,10 @@
 
 Deliberately independent of common.py, which opens the registry database on import.
 """
+from sentry_setup import init_sentry
+
+init_sentry()   # oxjob #1685
+
 import argparse
 from datetime import datetime, timezone
 import hashlib

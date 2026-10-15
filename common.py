@@ -1,6 +1,10 @@
 import os
 from urllib.parse import urlparse
 
+from sentry_setup import init_sentry
+
+init_sentry()   # every scheduled script imports common, award_fetch or datacite (oxjob #1685)
+
 import logging
 import sqlalchemy
 from sqlalchemy.orm import declarative_base, sessionmaker
