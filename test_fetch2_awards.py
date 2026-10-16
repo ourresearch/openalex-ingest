@@ -22,7 +22,7 @@ class Fetch2Tests(unittest.TestCase):
     def test_destinations_and_monthly_no_io(self):
         for source, module, schema in [('european_commission', cordis, CORDIS_SCHEMA),
                                        ('gates', gates, GATES_SCHEMA), ('kaken', kaken, KAKEN_SCHEMA)]:
-            with patch.dict(os.environ, {source.upper()+'_AWARDS_S3_PREFIX': f's3://openalex-ingest/awards/{source}/'}):
+            with patch.dict(os.environ, {source.upper()+'_AWARDS_S3_PREFIX': f's3://openalex-ingest/awards/dev-gr1009/{source}/'}):
                 with self.assertRaises(ValueError):
                     award_fetch.destination(source, datetime.now(timezone.utc))
             self.assertTrue(award_fetch.is_due(source, datetime(2026, 11, 1)))

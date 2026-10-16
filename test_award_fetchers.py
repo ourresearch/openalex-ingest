@@ -23,8 +23,8 @@ class FetchTests(unittest.TestCase):
         now = datetime(2026, 10, 5, tzinfo=timezone.utc)
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(award_fetch.destination('nsf', now),
-                             ('openalex-ingest', 'awards/dev-gr1009/nsf/2026-10-05.parquet'))
-        with patch.dict(os.environ, {'NSF_AWARDS_S3_PREFIX': 's3://openalex-ingest/awards/nsf/'}):
+                             ('openalex-ingest', 'awards/nsf/2026-10-05.parquet'))
+        with patch.dict(os.environ, {'NSF_AWARDS_S3_PREFIX': 's3://openalex-ingest/awards/dev-gr1009/nsf/'}):
             with self.assertRaises(ValueError):
                 award_fetch.destination('nsf', now)
         self.assertTrue(award_fetch.is_due('nsf', now))
@@ -127,6 +127,67 @@ class FetchTests(unittest.TestCase):
                 award_fetch.run('nsf', fail, NSF_SCHEMA)
             client.assert_not_called()
         self.assertFalse(directory[0].exists())
+
+    def test_sentry_never_sends_frame_locals(self):
+        # Frame locals can hold secrets such as KAKEN's appid; Sentry must not capture them.
+        import sentry_setup
+        with patch.dict(os.environ, {'SENTRY_DSN': 'https://k@example.invalid/1'}), \
+                patch.object(sentry_setup, '_initialized', False), \
+                patch.object(sentry_setup.sentry_sdk, 'init') as init:
+            sentry_setup.init_sentry()
+        self.assertIs(init.call_args.kwargs['include_local_variables'], False)
+        self.assertIs(init.call_args.kwargs['send_default_pii'], False)
+
+    def test_sentry_event_carries_no_query_secret(self):
+        # Real SDK, real HTTP request to a local server: neither frame locals nor the
+        # httplib breadcrumb may carry the query-string secret. before_send drops the event.
+        import http.server
+        import threading
+        import requests
+        import sentry_sdk
+        import sentry_setup
+
+        class Quiet(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'ok')
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), Quiet)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        events = []
+        secret = 'appid-' + os.urandom(8).hex()  # Runtime value, as KAKEN_APPID is; never in source context.
+        real_init = sentry_sdk.init
+
+        def init(**kwargs):
+            return real_init(**kwargs, before_send=lambda event, hint: events.append(event))
+
+        try:
+            with patch.dict(os.environ, {'SENTRY_DSN': 'https://k@example.invalid/1'}), \
+                    patch.object(sentry_setup, '_initialized', False), \
+                    patch.object(sentry_setup.sentry_sdk, 'init', side_effect=init):
+                sentry_setup.init_sentry()
+
+                def fetch():
+                    appid = secret
+                    url = f'http://127.0.0.1:{server.server_port}/opensearch?appid={appid}&st=1'
+                    requests.get(url, timeout=5)
+                    raise RuntimeError('KAKEN download failed') from None
+
+                try:
+                    fetch()
+                except RuntimeError as error:
+                    sentry_sdk.capture_exception(error)
+        finally:
+            sentry_sdk.get_client().close()
+            server.shutdown()
+        self.assertEqual(len(events), 1)
+        crumbs = events[0]['breadcrumbs']['values']
+        self.assertTrue(any('/opensearch' in json.dumps(c) for c in crumbs))
+        self.assertNotIn(secret, json.dumps(events[0], default=str))
 
 
 if __name__ == '__main__':

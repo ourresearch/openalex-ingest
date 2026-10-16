@@ -101,5 +101,5 @@ BATCH_SIZE = 5000       # Records per S3 file
 
 ## Award fetchers
 
-`python -m nsf_awards` and `python -m wellcome_awards` write dated parquet snapshots to the grants dev prefixes.
+`python -m nsf_awards`, `wellcome_awards`, `cordis_awards`, `gates_awards` and `kaken_awards` write dated parquet snapshots to `s3://openalex-ingest/awards/<source>/`, the prefixes walden's nightly Awards job reads.
 See [FETCH.md](FETCH.md) for configuration, scheduling, validation and rollback.

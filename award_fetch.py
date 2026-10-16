@@ -1,4 +1,4 @@
-"""Shared bounded downloads and dev-only publication for award fetchers.
+"""Shared bounded downloads and production publication for award fetchers.
 
 Deliberately independent of common.py, which opens the registry database on import.
 """
@@ -67,10 +67,11 @@ def download(session, url, path, expected_size=None):
 
 
 def destination(source, date):
-    allowed = f"s3://openalex-ingest/awards/dev-gr1009/{source}/"
+    # The prefix walden's Awards job (CreateOrUpdateAwards.sql) reads; it takes the newest object.
+    allowed = f"s3://openalex-ingest/awards/{source}/"
     prefix = os.environ.get(f"{source.upper()}_AWARDS_S3_PREFIX", allowed)
     if prefix != allowed:
-        raise ValueError(f"This dev build only permits {allowed}")
+        raise ValueError(f"Award fetchers only publish to {allowed}")
     parsed = urlparse(prefix)
     return parsed.netloc, parsed.path.lstrip("/") + f"{date:%Y-%m-%d}.parquet"
 
@@ -80,7 +81,7 @@ def is_due(source, now):
 
 
 def previous_rows(s3, bucket, prefix):
-    """Compare with the newest complete dev snapshot; S3 errors must not bypass the guard."""
+    """Compare with the newest complete snapshot under the prefix; S3 errors must not bypass the guard."""
     objects = (obj for page in s3.get_paginator("list_objects_v2").paginate(
         Bucket=bucket, Prefix=prefix) for obj in page.get("Contents", [])
         if obj["Key"].endswith(".parquet"))
@@ -97,7 +98,7 @@ def previous_rows(s3, bucket, prefix):
 
 
 def run(source, build, schema):
-    parser = argparse.ArgumentParser(description=f"Fetch {source} awards into the dev S3 prefix")
+    parser = argparse.ArgumentParser(description=f"Fetch {source} awards into the S3 prefix the Awards job reads")
     parser.add_argument("--scheduled", action="store_true",
                         help="Daily Scheduler entry: run Monday (NSF) or day 1 (other awards), UTC")
     args = parser.parse_args()

@@ -11,9 +11,9 @@ Both supplied origin/main laptop scripts are byte-identical to current GitHub or
 
 Run NSF: python -m nsf_awards
 Run Wellcome: python -m wellcome_awards
-NSF_AWARDS_S3_PREFIX defaults to s3://openalex-ingest/awards/dev-gr1009/nsf/.
-WELLCOME_AWARDS_S3_PREFIX defaults to s3://openalex-ingest/awards/dev-gr1009/wellcome/.
-This build rejects any other prefix before network or S3 access.
+NSF_AWARDS_S3_PREFIX defaults to s3://openalex-ingest/awards/nsf/ (the prefix walden's Awards job reads).
+WELLCOME_AWARDS_S3_PREFIX defaults to s3://openalex-ingest/awards/wellcome/.
+Any other prefix (including the old awards/dev-gr1009/) is rejected before network or S3 access.
 Object names use the run-start UTC date: YYYY-MM-DD.parquet.
 No registry database access and no Databricks API calls.
 
@@ -25,7 +25,7 @@ Wellcome retains Internal ID grant_ref, fallback, date/amount conversion and ded
 Production column order and Arrow types are frozen in award_schemas.py.
 New populated NSF null-only fields or changed Wellcome columns fail for review.
 HTTP has timeouts/retries; partial inputs and empty outputs cannot upload.
-Repeat runs reject shrink versus the newest dev parquet; failed baseline reads also stop.
+Repeat runs reject shrink versus the newest parquet under the prefix; failed baseline reads also stop.
 Uploads use boto3 single PUT; HEAD verifies bytes and SHA256 metadata.
 Temporary raw and parquet files are removed on completion or failure.
 Download guards require 1 GiB reserve initially and stop below 512 MiB.
@@ -39,15 +39,16 @@ Schedule (Advanced Scheduler add-on, cron, UTC):
   Wellcome: `0 20 1 * *`  python -m wellcome_awards --scheduled   (full fetch on day 1)
 Manual commands without --scheduled run immediately for a missed run or retry.
 Failures exit nonzero with a JSON log line; Rohan watches them.
-Uploads are refused unless the prefix is exactly s3://openalex-ingest/awards/dev-gr1009/{nsf,wellcome}/ (checked in code before any I/O).
-Each Awards run reads the newest snapshot only; prune old dev snapshots before the Awards job is unpaused.
-Production promotion requires a separately approved prefix-guard change and DESIGN rollout gates.
+Uploads are refused unless the prefix is exactly s3://openalex-ingest/awards/<source>/ (checked in code before any I/O).
+Each Awards run reads the newest object per prefix only (max LastModified, then path); older objects are ignored.
+Prod promotion (ce1015-awards-prod-prefix): the next 00:30 UTC Awards run after a fetch MERGEs the fresh object.
 
 Rollback:
   1. Delete the two Advanced Scheduler entries.
   2. `heroku rollback <previous release> -a openalex-ingest` (the release before this push).
   3. `git revert` the award-fetcher commits on main (no force-push).
-  4. If needed, delete objects under s3://openalex-ingest/awards/dev-gr1009/{nsf,wellcome}/.
+  4. Delete every dated object (YYYY-MM-DD.parquet) the fetchers wrote under s3://openalex-ingest/awards/<source>/;
+     otherwise the next 00:30 UTC Awards run still reads it as the newest object.
 
 Wellcome run: 26,288 rows; 19,818,446 bytes; 16.434 seconds.
 Wellcome prod: 19,618 rows; 15,277,282 bytes; modified 2026-07-31T13:57:33Z.
@@ -77,7 +78,7 @@ Run: python -m cordis_awards; python -m gates_awards; python -m kaken_awards.
 Each accepts --scheduled and runs only on UTC day 1; manual runs bypass the calendar.
 Origin scripts specify no other recurring cadence. No Scheduler entry was created.
 EUROPEAN_COMMISSION_AWARDS_S3_PREFIX, GATES_AWARDS_S3_PREFIX and KAKEN_AWARDS_S3_PREFIX
-accept only s3://openalex-ingest/awards/dev-gr1009/{european_commission,gates,kaken}/ respectively.
+accept only s3://openalex-ingest/awards/{european_commission,gates,kaken}/ respectively.
 The shared harness dates object names YYYY-MM-DD.parquet and verifies the upload.
 KAKEN requires KAKEN_APPID in the process environment before any HTTP request.
 No local .env auto-loading, credential logging, HTML scraping, registry or Databricks access.
