@@ -719,7 +719,6 @@ yurisdiksi.unmerbaya.ac.id
 
 # Refuse or drop 44.208.99.237 but answer 18.213.181.255 (first run on the new IP, 2026-10-15; Identify via both
 # routes, checked twice). Not told about any IP: a firewall default or a rate ban. Ask, or retest, before the retire date.
-api.archives-ouvertes.fr
 edoc.bbaw.de
 eprints.vu.edu.au
 journal.isi-padangpanjang.ac.id
