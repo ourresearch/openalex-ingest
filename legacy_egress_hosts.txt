@@ -3,9 +3,6 @@
 # An entry matches the host and its subdomains. Remove a host once it passes from the new IP; the list is
 # emptied, and QuotaGuard cancelled, on the retire date (oxjob #1604).
 
-# NII / IRDB (allowlisted both IPs, 2026-03-26)
-irdb.nii.ac.jp
-
 # Zendesk tickets naming the old IP, outside #1560 (oxjob #1604 evidence/zendesk_tickets_naming_old_ips.csv)
 # 5789 dadun.unav.edu (asked, no reply)
 dadun.unav.edu
