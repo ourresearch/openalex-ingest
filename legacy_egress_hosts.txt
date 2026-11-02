@@ -719,12 +719,10 @@ yurisdiksi.unmerbaya.ac.id
 edoc.bbaw.de
 eprints.vu.edu.au
 journal.isi-padangpanjang.ac.id
-jstatsoft.org
 opus.bibliothek.uni-wuerzburg.de
 opus4.kobv.de
 publishup.uni-potsdam.de
 revistas.inah.gob.mx
-revistas.unilasalle.edu.br
 tesjournal.com
 vuir.vu.edu.au
 www.metodosdeinformacion.es
