@@ -99,3 +99,21 @@ KAKEN output is the measured production 17-column schema.
 Six API-only fields are deliberately omitted: amount_direct, amount_indirect, project_type,
 project_status, institution_nii_code, members_json. No SQL migration is needed.
 These three production schemas are frozen in award_schemas.py.
+
+Gateway to Research (UKRI: AHRC, BBSRC, EPSRC, ESRC, MRC, NERC, STFC, Innovate UK).
+Run: python -m gtr_awards. --scheduled runs on UTC day 1 only. No key needed.
+GATEWAY_TO_RESEARCH_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/gateway_to_research/.
+The old laptop file (s3://openalex-ingest/awards/gtr/gtr_projects.parquet, 2026-05-15) stays where it is; nothing reads it after the walden move.
+Three bulk passes at 100 per page, one page at a time, 0.5 s apart: /persons (JSON), /funds (XML), /projects (XML).
+Persons are read as JSON because the XML form leaves out orcidId; the other two keep walden's laptop parser (gtr_to_s3.py, origin d3fd37ba).
+Every page is checked against totalSize/totalPages; a moved total, a short or repeated page, or a final count short of totalSize aborts.
+Projects are deduplicated on lower(grant reference), first page wins; projects without an RCUK reference are dropped (walden drops them too).
+persons: one entry per person linked to the project (every *_PER link), best role plus all roles, sorted by role rank, family name, given name, person id.
+More than 0.5% of person links naming no listed person refuses the upload.
+Dates keep the laptop conversion (UTC date of GtR's instant), so UK summer dates stay one day early, as served today.
+Measured 2026-11-02: 158,710 projects, 95,176 persons, 158,710 funds: 4,128 pages, about 2 hours, about 1.6 GB downloaded one page at a time.
+GtR re-keyed its records in 2026-09: ids in the 2026-05 file do not carry over (19 of 200 sampled old project ids now open another grant).
+Schedule (after the first manual run is checked and walden reads the prefix):
+  GtR:      `0 20 1 * *`  python -m gtr_awards --scheduled   (full fetch on day 1)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/gateway_to_research/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip GtR and fail).

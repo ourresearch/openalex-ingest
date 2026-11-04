@@ -154,3 +154,37 @@ KAKEN_SCHEMA = pa.schema([
     ('landing_page_url', pa.string()),
     ('ingested_at', pa.string()),
 ])
+
+# Gateway to Research (gtr_awards.py). The first 16 columns are walden's saved laptop file (s3://openalex-ingest/awards/gtr/
+# gtr_projects.parquet, 2026-05-15, read-only footer) in its order, with pi_given_name and pi_family_name typed string
+# (that file wrote them as Arrow null, which Databricks read as INT). pi_orcid and persons are new.
+GTR_PERSON = pa.struct([
+    ('person_id', pa.string()),
+    ('role', pa.string()),
+    ('roles', pa.list_(pa.string())),
+    ('given_name', pa.string()),
+    ('other_names', pa.string()),
+    ('family_name', pa.string()),
+    ('orcid', pa.string()),
+])
+
+GTR_SCHEMA = pa.schema([
+    ('project_id', pa.string()),
+    ('grant_reference', pa.string()),
+    ('title', pa.string()),
+    ('abstract', pa.string()),
+    ('status', pa.string()),
+    ('grant_category', pa.string()),
+    ('lead_funder', pa.string()),
+    ('amount', pa.float64()),
+    ('start_date', pa.string()),
+    ('end_date', pa.string()),
+    ('lead_org_id', pa.string()),
+    ('lead_org_name', pa.string()),
+    ('pi_id', pa.string()),
+    ('pi_given_name', pa.string()),
+    ('pi_family_name', pa.string()),
+    ('ingested_at', pa.string()),
+    ('pi_orcid', pa.string()),
+    ('persons', pa.list_(GTR_PERSON)),
+])
