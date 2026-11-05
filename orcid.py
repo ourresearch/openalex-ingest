@@ -15,10 +15,13 @@ AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 date_format = '%Y-%m-%d %H:%M:%S.%f'
 date_format_no_millis = '%Y-%m-%d %H:%M:%S'
 max_threads = 32
-summaries_bucket = 'v3.0-summaries'
+summaries_bucket = 'v3.0-summaries-prod-use2'
+lambda_bucket = 'orcid-lambda-file-prod-use2'
+orcid_region = 'us-east-2'
 
 # set up orcid s3 client
 s3_orcid = boto3.client('s3', 
+                region_name=orcid_region,
                 aws_access_key_id=ORCID_ACCESS_KEY,
                 aws_secret_access_key=ORCID_SECRET_KEY)
 
@@ -47,6 +50,7 @@ def sync_orcid_summary(orcid_to_sync):
 
     # set up orcid s3 client
     s3_orcid_temp = boto3.client('s3', 
+                    region_name=orcid_region,
                     aws_access_key_id=ORCID_ACCESS_KEY,
                     aws_secret_access_key=ORCID_SECRET_KEY)
 
@@ -83,7 +87,7 @@ def main():
     LOGGER.info(f"Last update date: {last_update}")
 
     LOGGER.info('Downloading the lambda file')	
-    s3_orcid.download_file('orcid-lambda-file', 'last_modified.csv.tar', './last_modified.csv.tar')
+    s3_orcid.download_file(lambda_bucket, 'last_modified.csv.tar', './last_modified.csv.tar')
 
     LOGGER.info('Uploading the lambda file to S3')
     s3_openalex.upload_file('last_modified.csv.tar', 'openalex-ingest', 'orcid/last_modified.csv.tar')
