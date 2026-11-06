@@ -193,3 +193,19 @@ Hand step per NHMRC release (2-4 a year; NHMRC releases in stages, re-issuing a 
   The next 00:30 UTC Awards run reads the new object (walden sources.csv row nhmrc, cadence manual).
 Rollback: delete the dated objects under awards/nhmrc_outcomes/ only after walden's Awards job no longer reads that prefix
   (an empty prefix makes the job skip nhmrc and fail); revert the commit. The frozen inputs are never written.
+
+Research Council of Norway (Forskningsrådet), Prosjektbanken, Kilde=FORISS (RCN's own grants). Run: python -m rcn_awards.
+--scheduled runs on UTC day 1 only. No key needed.
+RCN_PROJECT_BANK_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/rcn_project_bank/.
+The old laptop file (s3://openalex-ingest/awards/research_council_norway/research_council_norway_projects.parquet, 2026-06-04,
+44,316 rows) stays where it is; nothing reads it after the walden move.
+Reads the explore page's __NEXT_DATA__ for the current Next.js buildId, then /_next/data/<buildId>/en/explore/projects.json,
+500 per page, 0.5 s apart, checked against pagination.totalHits; walden's laptop parser (research_council_norway_to_s3.py,
+origin e22fdf7f) ported unchanged: the same 28 string columns, alphabetical, sorted by source_record_id.
+Refuses the upload on: no buildId, an empty page before totalHits, totalHits moving mid-pull, a project id repeated while
+paging, distinct projects != totalHits, or a duplicate award id. totalHits goes in the object's footer (openalex.funder_total). Prosjektbanken's robots.txt disallows named AI crawlers only.
+Not yet run from Heroku (2026-11-05): the first manual run is its live test (expect ~44.5k rows, ~90 pages, a few minutes).
+Schedule (after the first manual run is checked and walden reads the prefix):
+  RCN:      `0 20 1 * *`  python -m rcn_awards --scheduled   (full fetch on day 1)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/rcn_project_bank/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip RCN and fail).

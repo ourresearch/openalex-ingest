@@ -288,3 +288,13 @@ NHMRC_SCHEMA = pa.schema([
     ('institution', pa.string()),
     ('budget_total', pa.string()),
 ])
+
+# Research Council of Norway, Prosjektbanken FORISS (rcn_awards.py): the saved laptop file's 28 columns
+# (s3://openalex-ingest/awards/research_council_norway/research_council_norway_projects.parquet, 2026-06-04, read-only
+# footer), in its (alphabetical) order, all string.
+RCN_SCHEMA = pa.schema([(name, pa.string()) for name in (
+    'currency', 'current_activity_code', 'current_activity_json', 'current_activity_year', 'disciplines_json',
+    'display_name', 'downloaded_at', 'end_date', 'end_year', 'funder_award_id', 'geographies_json', 'landing_page_url',
+    'lead_family_name', 'lead_given_name', 'lead_name', 'organizations_json', 'pop_sci_description',
+    'primary_organization', 'project_id', 'project_summary', 'source', 'source_list_url', 'source_record_id',
+    'start_date', 'start_year', 'teaser', 'total_funding', 'years_active_json')])
