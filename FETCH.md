@@ -173,3 +173,23 @@ Rollback: delete the Scheduler entry, revert the commit, and delete the dated ob
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip TÜBİTAK and fail).
 Memory: the laptop run peaked at ~1.0 GB RSS before rows were written in chunks of 2,000; run the one-off and the Scheduler
 entry on a standard-2x dyno (`heroku run --size=standard-2x python -m tubitak_awards -a openalex-ingest`).
+
+NHMRC (Australia) outcomes: a manual source, one object. Run: python -m nhmrc_awards (no key; no Scheduler entry).
+NHMRC_OUTCOMES_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/nhmrc_outcomes/.
+NHMRC publishes per-round "Summary of results" XLSX only on www.nhmrc.gov.au, whose Akamai front refuses
+non-browser clients (2026-11-05: HTTP/2 INTERNAL_ERROR, HTTP/1.1 read timeout, even robots.txt), so the module downloads nothing.
+It reads, read-only: s3://openalex-ingest/awards/nhmrc/nhmrc_projects.parquet (2013-2025 rounds, frozen) and
+nhmrc_historical_1993_2016.parquet (frozen), plus every .xlsx under s3://openalex-ingest/awards/manual/nhmrc/ (parsed as
+walden's scripts/local/nhmrc_to_s3.py did; round year from NHMRC's file name; a drop's rows replace primary rows with the
+same grant id; later round, then later upload, wins). Output: part ('primary'|'historical') + the primary file's 64 columns
++ the 6 historical-only columns, all strings. Refuses: short frozen inputs (< 11,902 / 21,000 rows), changed columns,
+a drop with no round year in its name or no grant id / title / CIA column.
+Measured 2026-11-05 on the frozen inputs, no drops: 32,914 rows (11,902 primary + 21,012 historical), 5.7 MB, 6 s.
+Hand step per NHMRC release (2-4 a year; NHMRC releases in stages, re-issuing a round's file):
+  1. In a browser, download the round's "Summary of results" XLSX from
+     https://www.nhmrc.gov.au/funding/data-research/outcomes and keep NHMRC's file name (it carries the round year).
+  2. aws s3 cp <that file> s3://openalex-ingest/awards/manual/nhmrc/
+  3. heroku run -a openalex-ingest python -m nhmrc_awards   (prints one JSON line per drop and the totals)
+  The next 00:30 UTC Awards run reads the new object (walden sources.csv row nhmrc, cadence manual).
+Rollback: delete the dated objects under awards/nhmrc_outcomes/ only after walden's Awards job no longer reads that prefix
+  (an empty prefix makes the job skip nhmrc and fail); revert the commit. The frozen inputs are never written.
