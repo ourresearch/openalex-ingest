@@ -54,6 +54,7 @@ class FetchTests(unittest.TestCase):
             def get(self, *args, **kwargs): return Response()
         award = {'awd_id': '1234567', 'awd_amount': 42.0,
                  'perf_inst': {'perf_inst_name': 'University'},
+                 'inst': {'inst_name': 'Awardee University', 'inst_country_name': 'United States'},
                  'pi': [{'pi_full_name': 'A'}, {'pi_full_name': 'B'}]}
         def download(session, url, path, **kwargs):
             with zipfile.ZipFile(path, 'w') as z:
@@ -65,6 +66,8 @@ class FetchTests(unittest.TestCase):
             self.assertEqual(table.schema, NSF_SCHEMA)
             self.assertEqual(table['pi_count'].to_pylist(), [2])
             self.assertEqual(table['inst_name'].to_pylist(), ['University'])
+            self.assertEqual(table['awardee_name'].to_pylist(), ['Awardee University'])
+            self.assertEqual(table['awardee_country_name'].to_pylist(), ['United States'])
             self.assertFalse((Path(tmp) / 'download.zip').exists())
             award['awd_id'] = None
             with self.assertRaises(ValueError):

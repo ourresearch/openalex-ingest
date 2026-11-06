@@ -76,6 +76,13 @@ def flatten_award(award: dict) -> dict:
     flat['pi_count'] = 0
     flat['pi_all'] = None
 
+    # The awardee: NSF's Institution block, the organisation the award was made to. perf_inst above is the place of
+    # performance, which NSF leaves as 'DATA NOT AVAILABLE' on ~145k awards before FY1995 while naming the awardee
+    # (15,972 of 15,976 checked in FY1978 and FY1985; oxjob #2032). walden's NSF mapping reads these two columns there.
+    awardee = award.get('inst') if isinstance(award.get('inst'), dict) else {}
+    flat['awardee_name'] = awardee.get('inst_name')
+    flat['awardee_country_name'] = awardee.get('inst_country_name')
+
     pi_list = award.get('pi', [])
     if isinstance(pi_list, list) and pi_list:
         first_pi = pi_list[0]

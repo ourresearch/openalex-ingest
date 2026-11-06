@@ -24,6 +24,8 @@ Missing, ambiguous, or off-host workbook links fail; there is no old-URL fallbac
 Wellcome retains Internal ID grant_ref, fallback, date/amount conversion and deduplication.
 Production column order and Arrow types are frozen in award_schemas.py.
 New populated NSF null-only fields or changed Wellcome columns fail for review.
+NSF keeps the awardee (inst block) as awardee_name / awardee_country_name next to perf_inst's place of
+performance (inst_*), since 2026-11-05 (oxjob #2032): NSF leaves perf_inst 'DATA NOT AVAILABLE' on ~145k pre-FY1995 awards.
 HTTP has timeouts/retries; partial inputs and empty outputs cannot upload.
 Repeat runs reject shrink versus the newest parquet under the prefix; failed baseline reads also stop.
 Uploads use boto3 single PUT; HEAD verifies bytes and SHA256 metadata.

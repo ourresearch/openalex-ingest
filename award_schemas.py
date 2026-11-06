@@ -51,6 +51,9 @@ NSF_SCHEMA = pa.schema([
     ('pgm_ref_all', pa.string()),
     ('por_email', pa.null()),
     ('por_name', pa.null()),
+    # Added 2026-11-05 (oxjob #2032): the awardee (NSF's inst block), next to perf_inst's place of performance.
+    ('awardee_name', pa.string()),
+    ('awardee_country_name', pa.string()),
 ])
 
 WELLCOME_SCHEMA = pa.schema([
