@@ -188,3 +188,13 @@ GTR_SCHEMA = pa.schema([
     ('pi_orcid', pa.string()),
     ('persons', pa.list_(GTR_PERSON)),
 ])
+
+# FCT SciPROJ (fct_awards.py). The first 17 columns are the served laptop file (s3://openalex-ingest/awards/fct/fct_grants.parquet,
+# 2026-08-20, read-only footer) in its order, all strings; the people fields, the SciPROJ record id and the dump name are new.
+FCT_SCHEMA = pa.schema([(name, pa.string()) for name in (
+    'funder_award_id', 'title', 'pi_full', 'pi_given', 'pi_family', 'institution', 'amount', 'currency', 'scheme',
+    'start_date_raw', 'end_date_raw', 'description', 'landing_page_url', 'funder_key', 'institution_ror',
+    'institution_country', 'funding_type',
+    # the PI's ORCID (bare) and CIENCIA ID; team_json: the team members as JSON, in SciPROJ's order, without the PI:
+    # [{person_id, name, given, family, orcid, ciencia_id}]; never e-mail, birth date or gender
+    'pi_orcid', 'pi_ciencia_id', 'team_json', 'sciproj_id', 'source_dump', 'ingested_at')])

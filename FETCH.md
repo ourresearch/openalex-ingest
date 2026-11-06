@@ -117,3 +117,30 @@ Schedule (after the first manual run is checked and walden reads the prefix):
   GtR:      `0 20 1 * *`  python -m gtr_awards --scheduled   (full fetch on day 1)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/gateway_to_research/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip GtR and fail).
+
+FCT SciPROJ (Fundação para a Ciência e a Tecnologia, Portugal; FCT/FCCN's national project registry, CC BY 4.0).
+Run: python -m fct_awards. Weekly; SciPROJ compiles its dump weekly. No --scheduled: the Scheduler cron is Monday-only.
+Needs SCIPROJ_API_USERNAME and SCIPROJ_API_PASSWORD (HTTP Basic; the production login) in Heroku config, never in code,
+logs or URLs; a missing value fails the run before any HTTP request.
+FCT_SCIPROJ_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/fct_sciproj/.
+Lists /services/searches/projects/dump?year=YYYY (last year too in early January), takes the newest getDumpXMLyyyymmdd_PUB|PRV.zip on
+api.ptcris.pt with the agent `Mozilla/5.0 (compatible; OpenAlex-ingest/1.0; +https://openalex.org)` (SciPROJ's WAF
+refuses python-requests' default) (a public file wins a same-day tie; an off-host link is refused), downloads it once, and parses each CERIF
+record with walden's laptop parser (scripts/local/fct_to_s3.py) ported, with two changes (Rohan, 11-05: "as published, no fill-ins"):
+amount is the project total, the sum of the record's <Funded> streams (FCT's national share + FEDER co-funding; 6,618 records have
+2-5 streams), where the laptop took the first stream; a stream in any currency but EUR fails the run. And the frozen 2026-06 fct.pt
+XLSX list (its URL 404s) is no longer merged in.
+Added: pi_orcid, pi_ciencia_id, team_json (members in SciPROJ's order, PI and repeats left out), sciproj_id, source_dump.
+E-mail addresses, birth dates, gender and people's country codes in the private dump are never read into the output.
+Refuses upload below 100,000 rows, or when under 85% of FCT rows have a PI (a dump without Person, or truncated).
+Download links carry a token in their path; urllib3's retry log lines are redacted (getFileDump/***).
+Measured 2026-11-05 on the newest public file (getDumpXML20261104_PUB.zip, 215,849,280 bytes, 106 s to download from a laptop):
+106,785 records -> 106,785 rows, 25 s to parse; 49,563 with an amount; 533,404 team members (126k on projects), 42,487 PI ORCIDs.
+With this login SciPROJ lists public-profile files only (45 in 2026). Fellowship amounts and programmes are blank because FCT
+keeps them private; the public file has no e-mail, birth date or gender. The listing answers XML whatever Accept says.
+The old object (s3://openalex-ingest/awards/fct/fct_grants.parquet, 2026-08-20) and its zip stay where they are; nothing reads them
+after the walden move.
+Schedule (after the first manual run is gated and walden reads the prefix):
+  FCT:      `0 20 * * 1`  python -m fct_awards   (Mondays 20:00 UTC)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/fct_sciproj/ only after walden's
+  Awards job no longer reads that prefix.
