@@ -102,7 +102,8 @@ class Fetch2Tests(unittest.TestCase):
         xml='''<?xml version="1.0"?><results totalResults="1"><grantAward awardNumber="26H00001">
 <summary xml:lang="ja"><title>日本語</title><periodOfAward><startFiscalYear>2026</startFiscalYear></periodOfAward>
 <overallAwardAmount><totalCost>100000</totalCost><directCost>90000</directCost></overallAwardAmount>
-<member role="principal_investigator" researcherNumber="50287950"><personalName><familyName>Test</familyName><givenName>A</givenName></personalName></member></summary>
+<member role="principal_investigator" researcherNumber="50287950"><personalName><familyName>Test</familyName><givenName>A</givenName></personalName></member>
+<member role="co_investigator_buntan" researcherNumber="80304020"><personalName><familyName>Second</familyName><givenName>B</givenName></personalName></member></summary>
 <summary xml:lang="en"><title>Research title</title><category>Grant-in-Aid</category></summary>
 </grantAward></results>'''
         def download(session,url,path):path.write_text(xml)
@@ -115,13 +116,36 @@ class Fetch2Tests(unittest.TestCase):
             self.assertEqual(t['pi_nrid'].to_pylist(),['1000050287950'])
             self.assertEqual(t['start_date'].to_pylist(),['2026-04-01'])
             self.assertEqual(t['amount'].to_pylist(),[100000.0])
+            self.assertEqual(t['landing_page_url'].to_pylist(),['https://kaken.nii.ac.jp/en/grant/KAKENHI-PROJECT-26H00001/'])
             self.assertNotIn('amount_direct',t.column_names)
+            total=json.loads(pq.read_metadata(out).metadata[b'openalex.funder_total'])   # what the gate reads
+            self.assertEqual((total['value'],total['by_year'],total['excluded']),(1,{str(datetime.utcnow().year):1},{'projects repeated across start fiscal years':0}))
+            # every member, in KAKEN's order, for walden's kaken.sql (co-investigators -> investigators)
+            members=json.loads(t['members_json'][0].as_py())
+            self.assertEqual([(m['role'],m['family_name'],m['researcher_number']) for m in members],
+                             [('principal_investigator','Test','50287950'),('co_investigator_buntan','Second','80304020')])
             self.assertFalse((Path(tmp)/'page.xml').exists())
             p=Path(tmp)/'invalid.xml';p.write_text(xml.replace('totalResults="1"','totalResults="2"'))
             # A short page cannot silently become a partial full harvest.
             def short(session,url,path):path.write_bytes(p.read_bytes())
             with patch.object(kaken,'download',short),self.assertRaisesRegex(ValueError,'truncated'):
                 kaken.build(Path(tmp))
+
+    def test_kaken_appid_never_reaches_a_log_record(self):
+        secret='appid-'+os.urandom(8).hex()
+        import logging
+        with self.assertLogs('urllib3.connectionpool','WARNING') as logs:
+            logging.getLogger('urllib3.connectionpool').warning("Retrying (%r) after connection broken by '%r': %s",
+                'Retry(total=3)','err',f'/opensearch/?appid={secret}&format=xml&s1=2026')
+        self.assertNotIn(secret,''.join(logs.output))
+        self.assertIn('appid=***',''.join(logs.output))
+
+    def test_kaken_publishes_to_its_own_prefix(self):
+        # awards/kaken/ holds the page scrape walden reads; the API fetch lands beside it until walden's row moves
+        with patch.object(kaken,'run') as run:
+            kaken.main()
+        self.assertEqual(run.call_args[0][0],'kaken_api')
+        self.assertEqual(award_fetch.destination('kaken_api',datetime(2026,11,16))[1],'awards/kaken_api/2026-11-16.parquet')
 
     def test_disk_floor(self):
         with patch.object(award_fetch.shutil,'disk_usage',return_value=type('Disk',(),{'free':511*1024**2})()):

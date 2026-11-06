@@ -153,6 +153,8 @@ KAKEN_SCHEMA = pa.schema([
     ('products_json', pa.string()),
     ('landing_page_url', pa.string()),
     ('ingested_at', pa.string()),
+    # every project member (role, names, researcher number, affiliation) as JSON; walden's kaken.sql maps the co-investigators
+    ('members_json', pa.string()),
 ])
 
 # Gateway to Research (gtr_awards.py). The first 16 columns are walden's saved laptop file (s3://openalex-ingest/awards/gtr/

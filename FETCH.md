@@ -77,8 +77,8 @@ Batch 1 completion: CORDIS, Gates and KAKEN.
 Run: python -m cordis_awards; python -m gates_awards; python -m kaken_awards.
 Each accepts --scheduled and runs only on UTC day 1; manual runs bypass the calendar.
 Origin scripts specify no other recurring cadence. No Scheduler entry was created.
-EUROPEAN_COMMISSION_AWARDS_S3_PREFIX, GATES_AWARDS_S3_PREFIX and KAKEN_AWARDS_S3_PREFIX
-accept only s3://openalex-ingest/awards/{european_commission,gates,kaken}/ respectively.
+EUROPEAN_COMMISSION_AWARDS_S3_PREFIX, GATES_AWARDS_S3_PREFIX and KAKEN_API_AWARDS_S3_PREFIX
+accept only s3://openalex-ingest/awards/{european_commission,gates,kaken_api}/ respectively.
 The shared harness dates object names YYYY-MM-DD.parquet and verifies the upload.
 KAKEN requires KAKEN_APPID in the process environment before any HTTP request.
 No local .env auto-loading, credential logging, HTML scraping, registry or Databricks access.
@@ -96,8 +96,9 @@ KAKEN retains the origin EN/JA overlay, fiscal-year paging and first-ID deduplic
 Each XML page is streamed, checked against totalResults, written to parquet, then removed.
 Missing totals, malformed records, short/repeated pages or changing totals abort.
 KAKEN output is the measured production 17-column schema.
-Six API-only fields are deliberately omitted: amount_direct, amount_indirect, project_type,
-project_status, institution_nii_code, members_json. No SQL migration is needed.
+Five API-only fields are deliberately omitted: amount_direct, amount_indirect, project_type,
+project_status, institution_nii_code. members_json (every member: role, names, researcher number, affiliation)
+is the 18th column; walden maps its co-investigators. No SQL migration is needed.
 These three production schemas are frozen in award_schemas.py.
 
 Gateway to Research (UKRI: AHRC, BBSRC, EPSRC, ESRC, MRC, NERC, STFC, Innovate UK).
@@ -144,3 +145,16 @@ Schedule (after the first manual run is gated and walden reads the prefix):
   FCT:      `0 20 * * 1`  python -m fct_awards   (Mondays 20:00 UTC)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/fct_sciproj/ only after walden's
   Awards job no longer reads that prefix.
+
+KAKEN moves to its own prefix (feeds-d, 2026-11): python -m kaken_awards publishes to s3://openalex-ingest/awards/kaken_api/.
+awards/kaken/ keeps the 2026-07-08 page scrape (kaken_projects.parquet) that walden's kaken row reads until its walden push points
+the row at awards/kaken_api/; a manual fetch therefore changes nothing served until that push, and the gate runs in between.
+members_json carries every project member in KAKEN's order (role code, family/given name, researcher number, e-Rad code,
+affiliation, institution NII code); walden maps co_investigator_buntan / co_investigator_renkei to investigators.
+Paging: one OpenSearch query per start fiscal year (o1=1, s1=s2=FY, 1964..this year), 500 per page; KAKEN caps a query at
+200,000 results and the largest start year holds well under that. ~1,120,000 projects is ~2,300 pages at >= 1 s each.
+KAKEN_APPID (the CiNii Web API application id) lives in Heroku config only; the URL that carries it is never logged.
+Schedule (after the first manual run is gated and walden reads the prefix):
+  KAKEN:    `0 20 1 * *`  python -m kaken_awards --scheduled   (full fetch on day 1)
+Rollback: delete the Scheduler entry, revert the commit; delete the dated objects under awards/kaken_api/ only after walden's
+  kaken row points back at awards/kaken/ (an empty prefix makes the Awards job skip KAKEN and fail).

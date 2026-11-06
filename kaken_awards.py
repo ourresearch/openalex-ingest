@@ -1,6 +1,10 @@
-"""KAKEN official API, monthly. Requires KAKEN_APPID; no scraper fallback."""
+"""KAKEN official API, monthly. Requires KAKEN_APPID; no scraper fallback.
+
+Publishes to s3://openalex-ingest/awards/kaken_api/, not awards/kaken/ (the 2026-07-08 page scrape walden reads until its kaken
+row moves): a manual run can then be gated before the Awards job reads it. members_json carries every project member."""
 from datetime import datetime
 import json
+import logging
 import os
 import re
 import time
@@ -12,6 +16,21 @@ from award_fetch import download, http_session, run, check_disk
 from award_schemas import KAKEN_SCHEMA
 
 API_URL = "https://kaken.nii.ac.jp/opensearch/"
+_APPID = re.compile(r"appid=[^&\s'\"]+")
+
+
+class _RedactAppid(logging.Filter):
+    """urllib3 logs the request URL when it retries (WARNING) or counts a retry (DEBUG); for KAKEN that URL carries the appid.
+    Sentry's logging integration and Heroku's log drain would both see it, so every such record is redacted first."""
+
+    def filter(self, record):
+        record.msg = _APPID.sub("appid=***", record.getMessage())   # format first: %d args stay numbers
+        record.args = ()
+        return True
+
+
+for _logger in ("urllib3.connectionpool", "urllib3.util.retry", "urllib3", "sentry_sdk.errors"):
+    logging.getLogger(_logger).addFilter(_RedactAppid())
 ROWS_PER_REQUEST = 500
 FIRST_FISCAL_YEAR = 1964
 
@@ -281,7 +300,8 @@ def parse_grant_award(ga) -> Optional[dict]:
         "institution": institution,
         "keywords": keywords,
         "products_json": json.dumps(products, ensure_ascii=False) if products else None,
-        "landing_page_url": f"https://kaken.nii.ac.jp/grant/KAKENHI-PROJECT-{award_number}/",
+        # the English page, as the page scrape (and so walden) has always served it: no re-date for a URL alone
+        "landing_page_url": f"https://kaken.nii.ac.jp/en/grant/KAKENHI-PROJECT-{award_number}/",
         # -- additive columns (not consumed by current notebooks) --
         "amount_direct": amount_direct,
         "amount_indirect": amount_indirect,
@@ -324,7 +344,7 @@ def parse_page(path):
 def build(directory):
     appid = get_appid()  # Before HTTP, S3, or raw-file creation.
     output = directory / "kaken.parquet"
-    seen = set()
+    seen, by_year, repeats = set(), {}, 0
     stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with http_session() as session, pq.ParquetWriter(output, KAKEN_SCHEMA) as writer:
         session.headers["User-Agent"] = "OpenAlex-KAKEN-Ingest/2.0 (contact@openalex.org)"
@@ -354,12 +374,13 @@ def build(directory):
                     if row["project_id"] not in seen:
                         seen.add(row["project_id"])
                         row["ingested_at"] = stamp
-                        # API enrichments are outside the measured 17-column prod contract.
+                        # API enrichments are outside the prod contract (the measured 17 columns + members_json).
                         extras = {"amount_direct", "amount_indirect", "project_type",
-                                  "project_status", "institution_nii_code", "members_json"}
+                                  "project_status", "institution_nii_code"}
                         if set(row) != set(KAKEN_SCHEMA.names) | extras:
                             raise ValueError("KAKEN output columns changed")
                         unique.append({name: row[name] for name in KAKEN_SCHEMA.names})
+                repeats += len(rows) - len(unique)   # projects already written under an earlier fiscal year
                 if unique:
                     writer.write_table(pa.Table.from_pylist(unique, schema=KAKEN_SCHEMA))
                 check_disk(directory)
@@ -370,11 +391,15 @@ def build(directory):
                     raise ValueError("KAKEN truncated or repeated page")
                 start += ROWS_PER_REQUEST
             print(f"KAKEN {year}: {count} records", flush=True)
+            by_year[str(year)] = expected
+        writer.add_key_value_metadata({"openalex.funder_total": json.dumps({   # the funder-total gate reads it
+            "measure": "KAKEN totalResults per start fiscal year (o1=1)", "value": sum(by_year.values()),
+            "excluded": {"projects repeated across start fiscal years": repeats}, "by_year": by_year})})
     return output
 
 
 def main():
-    run("kaken", build, KAKEN_SCHEMA)
+    run("kaken_api", build, KAKEN_SCHEMA)
 
 
 if __name__ == "__main__":
