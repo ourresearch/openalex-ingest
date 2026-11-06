@@ -200,3 +200,14 @@ FCT_SCHEMA = pa.schema([(name, pa.string()) for name in (
     # the PI's ORCID (bare) and CIENCIA ID; team_json: the team members as JSON, in SciPROJ's order, without the PI:
     # [{person_id, name, given, family, orcid, ciencia_id}]; never e-mail, birth date or gender
     'pi_orcid', 'pi_ciencia_id', 'team_json', 'sciproj_id', 'source_dump', 'ingested_at')])
+
+# TÜBİTAK projects from TR Dizin (tubitak_awards.py): the saved laptop file's 44 columns
+# (s3://openalex-ingest/awards/tubitak/tubitak_trdizin_projects.parquet, 2026-06-03, read-only footer), in its order, all string.
+TUBITAK_SCHEMA = pa.schema([(name, pa.string()) for name in (
+    'funder_award_id', 'trdizin_id', 'display_name', 'description', 'title_tr', 'title_en', 'abstract_tr', 'abstract_en',
+    'keywords_tr', 'keywords_en', 'project_number', 'project_group', 'publication_year', 'start_date', 'end_date',
+    'lead_name', 'lead_given_name', 'lead_family_name', 'lead_orcid', 'lead_role', 'contributors_json',
+    'other_investigators_json', 'contributor_count', 'subject_names', 'subject_roots', 'subjects_json', 'access_type',
+    'language', 'report_pages', 'pdf_id', 'view_count', 'download_count', 'first_index_date', 'index_date',
+    'source_doc_type', 'source_raw_path', 'source_notice_url', 'search_page_url', 'api_url', 'landing_page_url',
+    'duplicate_trdizin_ids_json', 'duplicate_source_count', 'reported_total', 'retrieved_at')])

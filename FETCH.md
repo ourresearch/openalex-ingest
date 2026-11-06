@@ -158,3 +158,18 @@ Schedule (after the first manual run is gated and walden reads the prefix):
   KAKEN:    `0 20 1 * *`  python -m kaken_awards --scheduled   (full fetch on day 1)
 Rollback: delete the Scheduler entry, revert the commit; delete the dated objects under awards/kaken_api/ only after walden's
   kaken row points back at awards/kaken/ (an empty prefix makes the Awards job skip KAKEN and fail).
+
+TÜBİTAK (ARDEB) projects from TR Dizin (ULAKBİM). Run: python -m tubitak_awards. --scheduled runs on UTC day 1 only. No key needed.
+TUBITAK_TRDIZIN_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/tubitak_trdizin/.
+The old laptop file (s3://openalex-ingest/awards/tubitak/tubitak_trdizin_projects.parquet, 2026-06-03, 27,345 rows) stays where it is;
+nothing reads it after the walden move.
+Reads TR Dizin's search API (https://search.trdizin.gov.tr/api/defaultSearch/publication/, facet-documentType=PROJECT), 100 per page,
+0.5 s apart; every page is checked against hits.total, and the distinct hit ids must equal it. walden's laptop parser (tubitak_to_s3.py,
+origin e22fdf7f) is ported unchanged: 44 string columns, project-number dedupe, lead = first MANAGER by order.
+Measured 2026-11-05 (laptop harness): 29,236 hits on 293 pages -> 28,687 projects, about 9 minutes, about 1,000 MB downloaded.
+Schedule (after the first manual run is checked and walden reads the prefix):
+  TÜBİTAK:  `0 20 1 * *`  python -m tubitak_awards --scheduled   (full fetch on day 1)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/tubitak_trdizin/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip TÜBİTAK and fail).
+Memory: the laptop run peaked at ~1.0 GB RSS before rows were written in chunks of 2,000; run the one-off and the Scheduler
+entry on a standard-2x dyno (`heroku run --size=standard-2x python -m tubitak_awards -a openalex-ingest`).
