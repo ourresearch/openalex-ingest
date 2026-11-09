@@ -317,3 +317,21 @@ Schedule (after the first manual run is checked and walden reads the prefix):
   GRB NSTC: `0 20 1 * *`  python -m grb_awards --scheduled   (full fetch on day 1)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/grb_nstc/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip the source and fail).
+
+Australian Research Council (ARC): Research Grants Search (dataportal.arc.gov.au/RGS/API), JSON:API. No key needed.
+Run: python -m arc_awards. --scheduled runs on UTC day 1 only.
+ARC_RGS_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/arc_rgs/.
+The old laptop file (s3://openalex-ingest/awards/arc/arc_projects.parquet, 2026-01-19) stays where it is; nothing reads it after the walden move.
+Two passes: the list (/grants, 1,000 per page, every page checked against meta total-size/total-pages; a moved total, a short or
+repeated page, or a final count short of total-size aborts), then one detail call per grant (/grants/{code}); the API refuses 'Include'.
+The first 20 columns are the laptop file's (scripts/local/arc_to_s3.py, retired in the same walden push) in its order and types.
+Detail adds project_start_date, people (title, given and family name, role, fellowship flag, ORCID; the lead first) and organisations.
+Detail calls start at most 1 per second over 2 connections. A detail call that fails after its retries leaves the grant with
+detail_status 'missing' (list columns only); more than 0.5% missing refuses the upload.
+Grants are deduplicated on lower(code), first page wins. RGS also lists grants other agencies fund and ARC administers
+(grant_funder: Office of National Intelligence, Department of Defence); they are kept, and walden's mapping decides.
+Measured 2026-11-05 (local harness, no upload): 34,963 grants listed (35 pages, 314 s); a seeded random 1,500 detail records: 0 failed, 3 retried, ~2.6 KB each, ~1.9 calls/s at the 2/s cap; at 1 call/s a full run is ~35k s (~9.7 h).
+Schedule (after the first manual run is checked and walden reads the prefix):
+  ARC:      `0 20 1 * *`  python -m arc_awards --scheduled   (full fetch on day 1; ~10 h at 1 detail call per second)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/arc_rgs/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip ARC and fail).

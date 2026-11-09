@@ -544,3 +544,50 @@ GRB_SCHEMA = pa.schema([
     ('source_row_count', pa.int64()),
     ('ingested_at', pa.string()),
 ])
+
+# Australian Research Council (arc_awards.py). The first 20 columns are walden's saved laptop file (s3://openalex-ingest/
+# awards/arc/arc_projects.parquet, 2026-01-19, read-only) in its order and types. The rest come from each grant's detail
+# record: project_start_date, people (ARC's investigators, the lead first), organisations, and detail_status (ok | missing).
+ARC_PERSON = pa.struct([
+    ('title', pa.string()),
+    ('given_name', pa.string()),
+    ('family_name', pa.string()),
+    ('role_name', pa.string()),
+    ('role_code', pa.string()),
+    ('is_fellowship', pa.bool_()),
+    ('orcid', pa.string()),
+    ('is_lead', pa.bool_()),
+])
+
+ARC_ORGANISATION = pa.struct([
+    ('name', pa.string()),
+    ('role_name', pa.string()),
+    ('state', pa.string()),
+])
+
+ARC_SCHEMA = pa.schema([
+    ('grant_id', pa.string()),
+    ('code', pa.string()),
+    ('title', pa.string()),
+    ('summary', pa.string()),
+    ('start_year', pa.int64()),
+    ('end_date', pa.string()),
+    ('grant_value', pa.float64()),
+    ('grant_status', pa.string()),
+    ('grant_funder', pa.string()),
+    ('program_name', pa.string()),
+    ('scheme_name', pa.string()),
+    ('scheme_code', pa.string()),
+    ('scheme_round', pa.string()),
+    ('submission_year', pa.int64()),
+    ('primary_field_of_research', pa.string()),
+    ('lead_investigator', pa.string()),
+    ('investigators', pa.string()),
+    ('grantee', pa.string()),
+    ('grant_priorities_json', pa.string()),
+    ('ingested_at', pa.string()),
+    ('project_start_date', pa.string()),
+    ('people', pa.list_(ARC_PERSON)),
+    ('organisations', pa.list_(ARC_ORGANISATION)),
+    ('detail_status', pa.string()),
+])
