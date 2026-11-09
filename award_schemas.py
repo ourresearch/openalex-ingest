@@ -506,3 +506,41 @@ NWO_SCHEMA = pa.schema([
     ('pi_member_id', pa.string()),
     ('pi_ror', pa.string()),
 ])
+
+# Taiwan GRB, NSTC plans (grb_awards.py, new 2026-11-05): one row per cited plan number, aggregated from GRB's open
+# per-year XML (ROC 111 on). Years stay strings, as in the laptop file walden's mapping read (TRY_CAST there).
+GRB_PERSON = pa.struct([
+    ('name', pa.string()),
+    ('given_name', pa.string()),
+    ('family_name', pa.string()),
+])
+
+GRB_SCHEMA = pa.schema([
+    ('funder_award_id', pa.string()),
+    ('plan_no', pa.string()),
+    ('projkey', pa.string()),
+    ('grb_id', pa.string()),
+    ('grb_ids', pa.list_(pa.string())),
+    ('display_name', pa.string()),
+    ('title_zh', pa.string()),
+    ('title_en', pa.string()),
+    ('executing_institution', pa.string()),
+    ('plan_year_roc', pa.string()),
+    ('research_type', pa.string()),
+    ('research_attribute', pa.string()),
+    ('research_field', pa.string()),
+    ('period_start_roc_ym', pa.string()),
+    ('period_end_roc_ym', pa.string()),
+    ('start_year', pa.string()),
+    ('end_year', pa.string()),
+    ('amount', pa.float64()),
+    ('currency', pa.string()),
+    ('pi', GRB_PERSON),
+    ('researchers', pa.list_(GRB_PERSON)),
+    ('researchers_institution', pa.string()),
+    ('keywords_zh', pa.string()),
+    ('keywords_en', pa.string()),
+    ('landing_page_url', pa.string()),
+    ('source_row_count', pa.int64()),
+    ('ingested_at', pa.string()),
+])

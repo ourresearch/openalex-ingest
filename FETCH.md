@@ -296,3 +296,24 @@ Schedule (after the first manual run is checked and walden reads the prefix):
   NWO:      `0 20 * * 1`  python -m nwo_awards   (full fetch Mondays; no --scheduled, see above)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/nwopen/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip nwopen and fail).
+
+Taiwan NSTC (GRB, the Government Research Bulletin). Run: python -m grb_awards. --scheduled runs on UTC day 1 only. No key.
+GRB_NSTC_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/grb_nstc/.
+The old laptop export (s3://openalex-ingest/awards/nstc_grb/nstc_grb_projects.parquet, 2026-06-03) stays where it is;
+walden's grb_nstc_projects mapping still reads its abstracts (GRB's open files have none). MOST stays frozen in walden.
+Source: GRB's open-data catalogue (data.gov.tw dataset 18707, Government Open Data License v1):
+  https://mas.nstc.gov.tw/OPENDATA/GetFile?format=csv&serialno=527&fileodr=1 lists one file per ROC year, linked through
+  tinyurl; the fetcher reads the year list there and downloads https://manager.grb.gov.tw/GRB_{year}_xml.zip directly.
+Every run reads ROC 111 (2022, NSTC's first year) to the newest catalogue year, one zip at a time, and keeps the plan organ
+  國家科學及技術委員會(本會). Annual rows aggregate to one row per plan number (spaces removed, upper case), as the laptop
+  script did: amounts summed (thousand TWD x 1000), first period start / last period end, first non-empty value otherwise.
+People: the PI and the researchers (研究人員) as printed, in GRB's order; Chinese names stay whole (walden splits them).
+Checks: the catalogue must list every year from 111 without a gap and be at most a year old; each zip must hold exactly
+  GRB_<year>.xml (under 512 MiB); every row needs a numeric ID; a past year under 5,000 NSTC rows (ROC 111: 1,000) refuses.
+XML is parsed with lxml iterparse, entities off, no network.
+Measured 2026-11-05 (local harness, build() only): 5 zips, 34 MB downloaded, 73,454 NSTC annual rows (111: 1,445;
+  112: 15,371; 113: 18,280; 114: 19,316; 115: 19,042) -> 56,917 awards, 23.5 MB parquet, 8 s (after download, ~12 s total).
+Schedule (after the first manual run is checked and walden reads the prefix):
+  GRB NSTC: `0 20 1 * *`  python -m grb_awards --scheduled   (full fetch on day 1)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/grb_nstc/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip the source and fail).
