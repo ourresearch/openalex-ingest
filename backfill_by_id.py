@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 from sickle.oaiexceptions import IdDoesNotExist
 
 from common import S3_BUCKET, Session
-from repositories import EndpointHarvester, StateManager, _get_my_sickle, _get_shared_s3_client
+from repositories import EndpointHarvester, StateManager, _get_my_sickle, _get_shared_s3_client, host_rate_limiter
 
 TRIES_PER_ID = 3
 
@@ -39,6 +39,7 @@ def main():
     parser.add_argument('--ids', required=True, help='s3://bucket/key of the identifier list')
     parser.add_argument('--id-prefix', default='', help='prepended to each line (e.g. oai:pubmedcentral.nih.gov:)')
     parser.add_argument('--chunk', type=int, default=1000, help='ids per chunk (one S3 file per datestamp per chunk)')
+    parser.add_argument('--per-sec', type=float, default=1.0, help='GetRecord requests per second (PMC sends 429s past ~1/s of heavy load)')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -61,6 +62,7 @@ def main():
         harvester = EndpointHarvester(endpoint, session)   # only its save_batch is used: no checkpoint, no health
         prefix = endpoint.metadata_prefix
         sickle = _get_my_sickle(endpoint.pmh_url)
+        host_rate_limiter.mark_slow(endpoint.pmh_url, interval=1.0 / args.per_sec)   # paces every request to the host
 
         started, n_ok, n_gone, failed = time(), 0, [], []
         for i, chunk in enumerate(chunks):
