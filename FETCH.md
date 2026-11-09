@@ -263,3 +263,16 @@ Schedule (after the first manual run is gated and walden reads the prefix):
   NIH:      `0 6 * * 1`  python -m nih_awards   (Monday 06:00 UTC = 01:00 ET, after RePORTER's Sunday refresh)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/nih_reporter/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip NIH and fail).
+
+FWF (Austrian Science Fund) from the FWF Open API (CC0).
+Run: python -m fwf_awards. FWF_OPEN_API_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/fwf_open_api/.
+The old OpenAIRE-derived file (s3://openalex-ingest/awards/fwf/fwf_projects.parquet, 2026-01-25) stays where it is; nothing reads it after the walden move.
+Bearer key: the one FWF publishes at https://openapi.fwf.ac.at/fwfkey/, read at run time and never logged (no registration, no Heroku config).
+One pass over /indexes/projects/documents, 1,000 per page, 1 s apart (21 pages); every page is checked against the listing's total.
+The projects index's updatedAt is read before and after: FWF rebuilds the index daily (~03:15 UTC) and its API ids change, so a moved stamp aborts (rerun).
+Rows are keyed on the project code (the grant DOI's suffix, P22135), first page wins, written sorted by code.
+Measured 2026-11-05: 20,600 projects, 13,834 with a PI ORCID; 22 GETs, 104 s, 51.8 MB parquet (summaries included).
+Schedule (after the first manual run is checked and walden reads the prefix):
+  FWF:      `0 20 * * 1`  python -m fwf_awards   (weekly, Mondays; no --scheduled: is_due is day-1 for every source but NSF)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/fwf_open_api/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip FWF and fail).
