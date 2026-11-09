@@ -241,3 +241,25 @@ Schedule (after the first manual run is checked and walden reads the prefixes; t
   USAspending: `0 21 20 * *`  python -m usaspending_awards   (monthly cron, no --scheduled)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under the 11 prefixes only after
   walden's Awards job no longer reads them (an empty prefix makes the job skip that row and fail).
+
+NIH RePORTER (National Institutes of Health and the HHS agencies it reports for; walden row nih_exporter, priority 3).
+Run: python -m nih_awards. No key needed. Weekly: the Scheduler entry is a cron with no --scheduled flag.
+NIH_REPORTER_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/nih_reporter/.
+The old laptop file (s3://openalex-ingest/awards/nih/nih_projects_combined.parquet, 2026-10-06) stays where it is; nothing reads it after the walden move.
+One object, the laptop file's 48 columns (NIH_SCHEMA), so walden's mapping reads both alike and the NIH fold's keys carry over:
+  FY1985-2025 from ExPORTER's annual project files, one ZIP at a time, CRC-checked, read with pandas dtype=str as the laptop script read them;
+  FY2026 to the current fiscal year from the RePORTER API v2 (projects/search), every project re-read in full each week.
+Rows are deduplicated on (full_project_num, subproject_id), newest fiscal year first (API years before ExPORTER years).
+API paging: whole-day windows of date_added (00:00:00-23:59:59), halved until each holds at most 15,000 projects (offset cap 14,999),
+sorted by appl_id; a moved total, a short or repeated page, or windows that do not add up to the year's total abort.
+One request a second (NIH's published limit); User-Agent OpenAlex-NIH-Ingest/1.0. NIH asks big jobs to run at night or weekends ET.
+Measured 2026-11-05: FY2026 69,881 projects in 9 windows, 319 s (~160 requests); FY2027 109 so far.
+ExPORTER: 41 files, 62 MB for FY2025 (195 MB CSV); every file last changed on or before 2026-07-09 (so the 10-06 laptop pull read the same files).
+One FY2025 download ended early with HTTP 200 and no Content-Length (19.5 of 62 MB): the CRC check (zipfile.testzip) rejects such a file.
+API records are written in ExPORTER's formats (to_exporter_row): checked against FY2025, where both exist, every column walden reads
+matches except where NIH edited the record after the July file. project_terms, ed_inst_type and the two renamed columns (cfda_code,
+foa_number) are left empty for API years: walden does not read them.
+Schedule (after the first manual run is gated and walden reads the prefix):
+  NIH:      `0 6 * * 1`  python -m nih_awards   (Monday 06:00 UTC = 01:00 ET, after RePORTER's Sunday refresh)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/nih_reporter/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip NIH and fail).
