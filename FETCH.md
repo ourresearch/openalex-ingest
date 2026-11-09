@@ -276,3 +276,23 @@ Schedule (after the first manual run is checked and walden reads the prefix):
   FWF:      `0 20 * * 1`  python -m fwf_awards   (weekly, Mondays; no --scheduled: is_due is day-1 for every source but NSF)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/fwf_open_api/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip FWF and fail).
+
+NWO (Dutch Research Council) from NWOpen (https://nwopen-api.nwo.nl/NWOpen-API/api/Projects; CC0 1.0; no key).
+Run: python -m nwo_awards. Weekly. No --scheduled: award_fetch.is_due keeps day 1 for every source but NSF, so the
+weekly cadence lives in the Scheduler's cron (below), not in the shared core.
+NWOPEN_AWARDS_S3_PREFIX accepts only s3://openalex-ingest/awards/nwopen/.
+The old laptop file (s3://openalex-ingest/awards/nwo/nwo_projects.parquet, 2026-01-08, 14,599 rows) stays where it is;
+nothing reads it after the walden move (walden's scripts/local/nwo_to_s3.py is deleted in the same push).
+One pass, 100 projects per page (the API maximum), one page at a time, 0.5 s apart (each page takes ~6 s to serve).
+Every page is checked against the listing's meta: count, pages and load date; a moved count or date (NWOpen reloads
+daily), a short page, a page of already-seen ids, or a final count short of meta.count aborts.
+Projects are deduplicated on project_id, first page wins; more than 0.5% duplicate ids refuses the upload.
+The first 16 columns are the laptop file's, parsed the same way (lead = first Main Applicant, else Project leader, else
+the first member; ORCID placeholder 'https://orcid.org/-' dropped); added: department, sub_department,
+parent_project_id, grant_doi (10.61686/...), award_amount (EUR), members (one per member_id, best role + all roles,
+sorted by role rank, family name, given name, member id), pi_member_id and pi_ror.
+Measured 2026-11-05 (local harness, no upload): 34,306 projects (34,311 listed, 5 ids twice), 344 pages, 574 s, 65.9 MB parquet, ~270 MB downloaded one page at a time.
+Schedule (after the first manual run is checked and walden reads the prefix):
+  NWO:      `0 20 * * 1`  python -m nwo_awards   (full fetch Mondays; no --scheduled, see above)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/nwopen/
+  only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip nwopen and fail).

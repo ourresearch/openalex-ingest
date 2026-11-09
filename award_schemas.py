@@ -460,3 +460,49 @@ FWF_SCHEMA = pa.schema([
     ('index_updated_at', pa.string()),
     ('ingested_at', pa.string()),
 ])
+
+# NWO (nwo_awards.py). The first 16 columns are walden's saved laptop file (s3://openalex-ingest/awards/nwo/
+# nwo_projects.parquet, 2026-01-08, read-only footer via read_files) in its order and types. The rest are new.
+NWO_MEMBER = pa.struct([
+    ('member_id', pa.string()),
+    ('role', pa.string()),
+    ('roles', pa.list_(pa.string())),
+    ('first_name', pa.string()),
+    ('initials', pa.string()),
+    ('prefix', pa.string()),
+    ('last_name', pa.string()),
+    ('degree_pre_nominal', pa.string()),
+    ('degree_post_nominal', pa.string()),
+    ('orcid', pa.string()),
+    ('organisation', pa.string()),
+    ('organisation_id', pa.string()),
+    ('ror', pa.string()),
+    ('active', pa.bool_()),
+])
+
+NWO_SCHEMA = pa.schema([
+    ('project_id', pa.string()),
+    ('title', pa.string()),
+    ('abstract', pa.string()),
+    ('grant_category', pa.string()),
+    ('funding_scheme_id', pa.int64()),
+    ('lead_funder', pa.string()),
+    ('start_date', pa.string()),
+    ('end_date', pa.string()),
+    ('reporting_year', pa.int64()),
+    ('lead_org_name', pa.string()),
+    ('pi_id', pa.string()),
+    ('pi_given_name', pa.string()),
+    ('pi_family_name', pa.string()),
+    ('products_json', pa.string()),
+    ('summary_updates_json', pa.string()),
+    ('ingested_at', pa.string()),
+    ('department', pa.string()),
+    ('sub_department', pa.string()),
+    ('parent_project_id', pa.string()),
+    ('grant_doi', pa.string()),
+    ('award_amount', pa.float64()),
+    ('members', pa.list_(NWO_MEMBER)),
+    ('pi_member_id', pa.string()),
+    ('pi_ror', pa.string()),
+])
