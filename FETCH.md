@@ -211,3 +211,33 @@ Schedule (after the first manual run is checked and walden reads the prefix):
   RCN:      `0 20 1 * *`  python -m rcn_awards --scheduled   (full fetch on day 1)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/rcn_project_bank/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip RCN and fail).
+
+USAspending prime awards (grants and cooperative agreements) for 11 walden rows: DOD, DOE, NASA, USDA, EPA, USAID,
+CDC, AHRQ, NOAA, NIST and DOE Office of Science. Replaces the 11 laptop scripts (walden scripts/local/<agency>_to_s3.py).
+Run: python -m usaspending_awards (all 11; a failed row does not stop the others; exit nonzero names the failed rows).
+One or more rows: USASPENDING_SOURCES=usaspending_cdc,usaspending_ahrq python -m usaspending_awards
+No key needed. User-Agent names OpenAlex. No registry or Databricks access.
+Prefixes (one per row; each USASPENDING_<AGENCY>_AWARDS_S3_PREFIX accepts only its own):
+  s3://openalex-ingest/awards/usaspending_{dod,doe,nasa,usda,epa,usaid,cdc,ahrq,noaa,nist,doe_sc}/
+The old laptop objects (awards/dod/, doe/, nasa/, usda/, epa/, cdc/, usaid/, noaa/, nist/, ahrq/, doe_sc/) stay where they are.
+Ten rows read the Award Data Archive (files.usaspending.gov/award_data_archive/), discovered from the public bucket listing:
+  the newest set of FY<year>_<toptier>_Assistance_Full_<date>.zip per agency, FY2007 through the fiscal year of its date
+  (and every year an older set lists), all one date, else stop.
+  Toptier files 097, 089, 080, 012, 068, 072, 075 (CDC and AHRQ), 013 (NOAA and NIST): each downloaded once per run.
+  Prime award types 02-05; agency filter as the laptop scripts (awarding toptier or subtier name); FAIN required.
+  One row per FAIN: the latest transaction (action_date, then modification_number as a number, then the transaction key).
+  Each ZIP's size is checked against the listing; reading each CSV member to its end checks its CRC; the ZIP is deleted.
+  usaspending.gov publishes no rate limit, but its CDN refused a laptop for over an hour after ~15 files 2 s apart (2026-11-05):
+  30 s before each archive file, one API or listing page per 2 s, a refused file retried twice 10 min apart (~85 min of waits a run);
+  each try is one request (no adapter retries for archive files).
+  Volume per run (set 20261006): 168 files, about 6.5 GB (USDA 4.1 GB, HHS 2.1 GB, the other six 0.3 GB).
+  The archive starts at FY2007: awards whose every transaction is older stay in raw as retained rows (no DELETE).
+DOE Office of Science reads POST /api/v2/search/spending_by_award/ (CFDA 81.049, types 02-05), one calendar year at a
+  time from 2008 (months when a year reaches the API's 10,000-row cap); a failed page or capped month stops the row.
+Columns are frozen in award_schemas.py: USASPENDING_SCHEMA (47 strings: what walden reads plus recipient UEI) and
+  USASPENDING_DOE_SC_SCHEMA (the laptop file's 13 strings).
+USAspending names no investigator: every row has 0 people, as today.
+Schedule (after the first manual run is checked and walden reads the prefixes; the archive set lands mid-month):
+  USAspending: `0 21 20 * *`  python -m usaspending_awards   (monthly cron, no --scheduled)
+Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under the 11 prefixes only after
+  walden's Awards job no longer reads them (an empty prefix makes the job skip that row and fail).
