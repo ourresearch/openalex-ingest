@@ -1278,9 +1278,11 @@ class MySickle(Sickle):
                     empty_response = '<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><responseDate>2024-11-11T14:30:00Z</responseDate><request verb="ListRecords">' + self.endpoint + '</request><error code="noRecordsMatch">No matching records found</error></OAI-PMH>'
                     http_response._content = empty_response.encode('utf-8')
                     http_response.status_code = 200
-                elif http_response.status_code == 404 and b'code="noRecordsMatch"' in (http_response.content or b'')[:4000]:
-                    # PMC answers an empty window with HTTP 404 and a valid OAI noRecordsMatch body (oxjob #2111):
-                    # hand the body to Sickle, which raises NoRecordsMatch, instead of failing the harvest.
+                elif http_response.status_code == 404 and re.search(
+                        rb'<error\s+code="(noRecordsMatch|idDoesNotExist)"', (http_response.content or b'')[:4000]):
+                    # PMC answers an empty window (noRecordsMatch) and an unknown identifier (idDoesNotExist) with
+                    # HTTP 404 and a valid OAI body (oxjob #2111): hand the body to Sickle, which raises the OAI
+                    # exception, instead of failing the harvest.
                     http_response.status_code = 200
                 elif http_response.status_code == 503:
                     retry_after = http_response.headers.get('Retry-After')

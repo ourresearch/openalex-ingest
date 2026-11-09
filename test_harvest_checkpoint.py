@@ -139,6 +139,19 @@ class EmptyWindowAs404(unittest.TestCase):
             with self.assertRaises(NoRecordsMatch):
                 sickle.ListRecords(metadataPrefix="oai_dc", **{"from": "2006-07-02", "until": "2006-07-02"})
 
+    def test_pmc_404_unknown_identifier_is_id_does_not_exist(self):
+        import requests
+        from sickle.oaiexceptions import IdDoesNotExist
+        body = (b'<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+                b'<responseDate>2026-11-09T15:40:00Z</responseDate><request>https://pmc.example/oai</request>'
+                b'<error code="idDoesNotExist">Identifier does not exist.</error></OAI-PMH>')
+        resp = requests.Response()
+        resp.status_code, resp._content, resp.url, resp.encoding = 404, body, "https://pmc.example/oai", "utf-8"
+        with patch.object(R, "_tls_tolerant_request", lambda *a, **k: resp):
+            sickle = R._get_my_sickle("https://pmc.example/oai")
+            with self.assertRaises(IdDoesNotExist):
+                sickle.GetRecord(identifier="oai:pubmedcentral.nih.gov:99999999999", metadataPrefix="oai_dc")
+
 
 if __name__ == "__main__":
     unittest.main()
