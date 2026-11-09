@@ -28,6 +28,9 @@ def record(rid, number, authors, year=2024, title="Başlık", extra=None):
     return {"_id": str(rid), "_source": src}
 
 
+OK = {"timed_out": False, "_shards": {"total": 3, "successful": 3, "skipped": 0, "failed": 0}}   # TR Dizin's envelope, 11-06
+
+
 class Api:
     """Serves hit pages through the download() seam; PAGE_SIZE is 2 in the tests, so paging is exercised."""
 
@@ -40,7 +43,7 @@ class Api:
         page, size = int(q["page"][0]), int(q["limit"][0])
         assert q["facet-documentType"] == ["PROJECT"] and size == tb.PAGE_SIZE
         self.calls.append(page)
-        body = self.override.get(page) or {"hits": {"total": {"value": self.total, "relation": self.relation},
+        body = self.override.get(page) or {**OK, "hits": {"total": {"value": self.total, "relation": self.relation},
                                                      "hits": self.hits[(page - 1) * size:page * size]}}
         path.write_text(json.dumps(body))
 
@@ -98,20 +101,20 @@ class TubitakFetcherTest(unittest.TestCase):
 
     def test_total_moving_or_short_pages_refuse(self):
         api = Api(HITS)
-        api.override[2] = {"hits": {"total": {"value": 5, "relation": "eq"}, "hits": HITS[2:4]}}
+        api.override[2] = {**OK, "hits": {"total": {"value": 5, "relation": "eq"}, "hits": HITS[2:4]}}
         with self.assertRaisesRegex(ValueError, "total moved"):
             self.build(api)
         api = Api(HITS)
-        api.override[2] = {"hits": {"total": {"value": 4, "relation": "eq"}, "hits": []}}
+        api.override[2] = {**OK, "hits": {"total": {"value": 4, "relation": "eq"}, "hits": []}}
         with self.assertRaisesRegex(ValueError, "empty"):
             self.build(api)
         api = Api(HITS)
-        api.override[2] = {"hits": {"total": {"value": 4, "relation": "eq"}, "hits": HITS[:2]}}   # a repeated page
+        api.override[2] = {**OK, "hits": {"total": {"value": 4, "relation": "eq"}, "hits": HITS[:2]}}   # a repeated page
         with self.assertRaisesRegex(ValueError, "distinct hits"):
             self.build(api)
         with self.assertRaisesRegex(ValueError, "no hits.total"):
             api = Api(HITS)
-            api.override[1] = {"hits": {"hits": HITS[:2]}}
+            api.override[1] = {**OK, "hits": {"hits": HITS[:2]}}
             self.build(api)
 
     def test_a_lower_bound_total_is_refused(self):
@@ -123,9 +126,21 @@ class TubitakFetcherTest(unittest.TestCase):
             self.build(api)
         self.assertEqual(api.calls, [1])   # refused on the first page, before any paging
         api = Api(HITS)
-        api.override[2] = {"hits": {"total": {"value": 4}, "hits": HITS[2:4]}}   # no relation on a later page: not exact either
+        api.override[2] = {**OK, "hits": {"total": {"value": 4}, "hits": HITS[2:4]}}   # no relation on a later page: not exact either
         with self.assertRaisesRegex(ValueError, "page 2: hits.total is None 4"):
             self.build(api)
+
+    def test_a_partial_shard_result_is_refused(self):
+        # Codex 11-06 (re-check): {_shards: {total 2, successful 1, failed 1}} with hits.total {1, eq} published a one-row
+        # snapshot whose footer total (1) also passed the funder gate. Every page must be complete.
+        ok = {"total": 3, "successful": 3, "skipped": 0, "failed": 0}
+        for envelope, why in (({"timed_out": False, "_shards": {"total": 2, "successful": 1, "skipped": 0, "failed": 1}}, "failed"),
+                              ({"timed_out": True, "_shards": ok}, "timed out"),
+                              ({"_shards": ok}, "no timed_out"), ({"timed_out": False}, "no _shards")):
+            api = Api(HITS[:1])
+            api.override[1] = dict(envelope, hits={"total": {"value": 1, "relation": "eq"}, "hits": HITS[:1]})
+            with self.assertRaisesRegex(ValueError, "page 1: partial result", msg=why):
+                self.build(api)
 
     def test_too_few_projects_refuse(self):
         hits = [record(i, None, [author("X Y", "MANAGER", 1)]) for i in range(11, 14)] + [HITS[0]]

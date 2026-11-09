@@ -8,7 +8,9 @@ in the same order, the same project-number dedupe (best record by MANAGER presen
 firstIndexDate, id) and the same lead rule (first MANAGER by order, else the first contributor), so walden's
 sources/trdizin_tubitak_projects.sql reads it as it read the saved file. source_raw_path is now the API URL.
 hits.total bounds the paging only when it is exact (relation "eq"): Elasticsearch reports {"value": 10000, "relation": "gte"}
-when it stops counting, and paging to that would silently stop at 10,000. The exact total is recorded in the parquet footer
+when it stops counting, and paging to that would silently stop at 10,000. Every page must also be complete: not timed out,
+every shard answering (an Elasticsearch partial result drops a failed shard's hits, total included). The exact total is
+recorded in the parquet footer
 (key openalex.funder_total) and in every row (reported_total) for the gate.
 """
 import json
@@ -256,6 +258,11 @@ def fetch_records(session, directory):
         download(session, page_url(page), raw)
         body = json.loads(raw.read_bytes())
         raw.unlink()
+        shards = body.get("_shards") or {}
+        if body.get("timed_out") is not False or not shards.get("total") or shards.get("failed") != 0 \
+                or shards.get("successful") != shards.get("total"):   # a partial result: its hits and total miss a shard
+            raise ValueError(f"TR Dizin page {page}: partial result (timed_out {body.get('timed_out')!r}, shards {shards}); "
+                             "refusing to trust its total")
         hits = body.get("hits") or {}
         total = (hits.get("total") or {}).get("value")
         if not isinstance(total, int) or total <= 0:
