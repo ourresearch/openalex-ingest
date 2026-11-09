@@ -576,6 +576,22 @@ class EndpointHarvester:
 
         self.logger.info(f"OAI-PMH request parameters: {args}")
 
+        # oxjob #2111: PMC lists a window in no datestamp order (2025-11-10, -12, -11, -09 ...) and mixes
+        # in records stamped months before 'from'. A mid-walk checkpoint then jumped to the newest date
+        # seen, and when the walk died the older records it hadn't reached were skipped for good: 411K
+        # PMC articles, all free to read, never reached OpenAlex. So checkpoint mid-walk only while the
+        # feed has stayed in order, and on an error after any step back put the checkpoint back where
+        # this run found it: the next run re-walks the window and nothing is lost.
+        in_order = True
+        prev_date_key = None
+        start_checkpoint = self.state.most_recent_date_harvested
+        # Records whose header has no datestamp are kept, filed under the window's last day, and left
+        # out of the order and checkpoint logic. PMC served oai:pubmedcentral.nih.gov:13700003 with an
+        # empty <datestamp>, and every run that reached it died ("argument of type 'NoneType' is not
+        # iterable"), every other day in Nov 2026.
+        undated = []
+        undated_key = (last or datetime.now(timezone.utc).date()).isoformat()
+
         try:
             my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics,
                                        fetch_via_zyte=bool(self.state.fetch_via_zyte),
@@ -605,7 +621,17 @@ class EndpointHarvester:
                 self.metrics.update_datestamp(record.header.datestamp)
 
                 datestamp = record.header.datestamp
+                if not datestamp:
+                    undated.append(record)
+                    self.logger.warning(f"No datestamp on {record.header.identifier}: filed under {undated_key}")
+                    continue
                 date_key = datestamp.split('T')[0] if 'T' in datestamp else datestamp
+                if prev_date_key is not None and date_key < prev_date_key:
+                    if in_order:
+                        self.logger.info(f"Feed out of datestamp order ({prev_date_key} then {date_key}): "
+                                         f"no more mid-walk checkpoints this run")
+                    in_order = False
+                prev_date_key = date_key
                 if max_date_key is None or date_key > max_date_key:
                     max_date_key = date_key
                 if min_date_key is None or date_key < min_date_key:
@@ -633,7 +659,7 @@ class EndpointHarvester:
                     batch_counters.pop(current_date_processing, None)
 
                     checkpoint_dt = parse_datestamp(current_date_processing)
-                    if not first_harvest and (not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested):
+                    if in_order and not first_harvest and (not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested):
                         self.state.most_recent_date_harvested = checkpoint_dt
                         self.db.merge(self.state)
                         self.db.commit()
@@ -681,6 +707,11 @@ class EndpointHarvester:
                     self.save_batch(s3_client, s3_bucket,
                                     batch_counters.get(leftover_date, 1),
                                     records_by_date[leftover_date], leftover_date)
+            if undated:
+                # shortcut: one file however many; fine while undated records stay a handful a run
+                records_saved += len(undated)
+                self.save_batch(s3_client, s3_bucket, 1, undated, undated_key)
+                self.logger.warning(f"Saved {len(undated)} record(s) with no datestamp under {undated_key}")
 
             # Reconcile: record_count counts records ITERATED, which is what made the drop
             # above invisible for as long as it existed. Compare against what we actually
@@ -701,8 +732,14 @@ class EndpointHarvester:
                     f"Short harvest: feed advertised {self.metrics.total_records}, "
                     f"saved {records_saved} + set aside {records_set_aside} for {self.state.pmh_url}")
 
-            # First harvest: the walk completed, so the max datestamp seen is safe.
-            final_date = max_date_key if first_harvest else current_date_processing
+            # First harvest: the walk completed, so the max datestamp seen is safe. Any other completed
+            # walk covered every record up to 'last'; on an ordered feed the last date walked says so too.
+            if first_harvest:
+                final_date = max_date_key
+            elif in_order:
+                final_date = current_date_processing
+            else:
+                final_date = last.isoformat()
             if final_date:
                 checkpoint_dt = parse_datestamp(final_date)
                 if not self.state.most_recent_date_harvested or checkpoint_dt > self.state.most_recent_date_harvested:
@@ -728,6 +765,21 @@ class EndpointHarvester:
                                         records_by_date[current_date_processing], current_date_processing)
                         self.logger.info(f"Saved partial batch for {current_date_processing} before error")
 
+                if undated:
+                    self.save_batch(s3_client, s3_bucket, 1, undated, undated_key)
+                    self.logger.info(f"Saved {len(undated)} record(s) with no datestamp before error")
+
+                if not first_harvest and not in_order:
+                    # The walk stepped back in date, so records older than any checkpoint written
+                    # this run may still be unread: put it back where this run found it (oxjob #2111).
+                    # A None start (a manual --start-date run on a never-checkpointed endpoint) is left
+                    # alone: None would turn the next run into a whole-feed first harvest.
+                    if start_checkpoint is not None and self.state.most_recent_date_harvested != start_checkpoint:
+                        self.state.most_recent_date_harvested = start_checkpoint
+                        self.db.merge(self.state)
+                        self.db.commit()
+                        self.logger.info(f"Out-of-order walk failed: checkpoint back to {start_checkpoint.date()}")
+                elif 'current_date_processing' in dir() and current_date_processing:
                     # Update checkpoint to last completed date (one before current)
                     # We don't checkpoint the current date since it may be incomplete.
                     # Never on a first harvest: its walk order is unknown (see above).
