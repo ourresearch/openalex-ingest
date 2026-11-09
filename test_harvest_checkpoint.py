@@ -123,5 +123,22 @@ class UndatedRecord(unittest.TestCase):
         self.assertEqual(cp, datetime(2026, 11, 6))
 
 
+class EmptyWindowAs404(unittest.TestCase):
+    def test_pmc_404_with_no_records_body_is_no_records_match(self):
+        # PMC, 9 Nov 2026: from=until=2006-07-02 answers HTTP 404 with <error code="noRecordsMatch">.
+        import requests
+        from sickle.oaiexceptions import NoRecordsMatch
+        body = (b'<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+                b'<responseDate>2026-11-09T15:15:28Z</responseDate><request>https://pmc.example/oai</request>'
+                b'<error code="noRecordsMatch">No records match the query.</error></OAI-PMH>')
+        resp = requests.Response()
+        resp.status_code, resp._content, resp.url = 404, body, "https://pmc.example/oai"
+        resp.encoding = "utf-8"
+        with patch.object(R, "_tls_tolerant_request", lambda *a, **k: resp):
+            sickle = R._get_my_sickle("https://pmc.example/oai")
+            with self.assertRaises(NoRecordsMatch):
+                sickle.ListRecords(metadataPrefix="oai_dc", **{"from": "2006-07-02", "until": "2006-07-02"})
+
+
 if __name__ == "__main__":
     unittest.main()
