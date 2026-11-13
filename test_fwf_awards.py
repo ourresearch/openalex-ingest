@@ -8,10 +8,11 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 import award_fetch
-from award_schemas import FWF_SCHEMA
+from award_schemas import FWF_OUTPUT, FWF_SCHEMA
 import fwf_awards as fwf
 
 KEY = "ab" * 32
@@ -33,11 +34,25 @@ def project(code, last="Muster", orcid="0000-0002-7747-4015", doi=True, **extra)
     return record
 
 
-class Api:
-    """Serves the key page, /indexes and paged documents through the download() seam (page size 2)."""
+def output(n, projects, doi=None, pmid=None, title=None, **extra):
+    record = {"id": f"output-{n}", "_str.category": "publications", "_str.type": "Journal Article",
+              "_list.connected.projects": [f"projects-{p}" for p in projects], "_list.year": ["2020"],
+              "_str.title": title or f"Paper {n}", "_list.author": ["Heid E", "Boresch S"]}
+    if doi:
+        record["_str.doi"] = doi
+    if pmid:
+        record["_str.pmid"] = pmid
+    record.update(extra)
+    return record
 
-    def __init__(self, projects, updated=("2026-11-05T03:15:32Z",)):
+
+class Api:
+    """Serves the key page, /indexes and paged documents of both indexes through the download() seam (page size 2)."""
+
+    def __init__(self, projects, updated=("2026-11-05T03:15:32Z",), outputs=None, output_updated=("2026-11-05T03:16:40Z",)):
         self.projects, self.updated, self.calls, self.total = projects, list(updated), [], None
+        self.outputs = outputs if outputs is not None else [output(1, []), output(2, [])]   # what project() lists
+        self.output_updated = list(output_updated)
 
     def download(self, session, url, path, **kwargs):
         parsed = urlparse(url)
@@ -47,13 +62,16 @@ class Api:
         elif parsed.path == "/indexes":
             assert session.headers["Authorization"] == f"Bearer {KEY}"
             stamp = self.updated.pop(0) if len(self.updated) > 1 else self.updated[0]
-            path.write_text(json.dumps({"results": [{"uid": "output", "updatedAt": "x"}, {"uid": "projects", "updatedAt": stamp}]}))
+            out = self.output_updated.pop(0) if len(self.output_updated) > 1 else self.output_updated[0]
+            path.write_text(json.dumps({"results": [{"uid": "output", "updatedAt": out}, {"uid": "projects", "updatedAt": stamp}]}))
         else:
             q = parse_qs(parsed.query)
             offset, limit = int(q["offset"][0]), int(q["limit"][0])
-            total = self.total if self.total is not None else len(self.projects)
+            docs = self.outputs if parsed.path == "/indexes/output/documents" else self.projects
+            assert parsed.path in ("/indexes/output/documents", "/indexes/projects/documents"), parsed.path
+            total = self.total if self.total is not None and docs is self.projects else len(docs)
             path.write_text(json.dumps({"offset": offset, "limit": limit, "total": total,
-                                        "results": self.projects[offset:offset + limit]}))
+                                        "results": docs[offset:offset + limit]}))
 
 
 def build_with(api):
@@ -88,9 +106,13 @@ class FwfTests(unittest.TestCase):
         self.assertIsNone(rows[3]["pi_orcid"])
         self.assertEqual(rows[3]["grant_doi"], "10.55776/pin1503126")          # from the API id when FWF gives no DOI
         self.assertEqual(api.calls[:2], ["/fwfkey/", "/indexes"])
+        self.assertEqual(api.calls.count("/indexes"), 2)                       # the stamps at the start and the end
         total = json.loads(table.schema.metadata[b"openalex.funder_total"])   # what the gate compares rows with
         self.assertEqual(total, {"measure": "FWF Open API projects index total (/indexes/projects/documents)", "value": 5,
-                                 "excluded": {"no readable project code": 0, "project code repeated (first page wins)": 1}})
+                                 "excluded": {"no readable project code": 0, "project code repeated (first page wins)": 1},
+                                 "outputs": {"output index total": 2, "project-output links written": 8,
+                                             "links to a project id the projects index doesn't hold": 0,
+                                             "links to an output id the output index doesn't hold": 0}})
 
     def test_moved_total_short_or_repeated_page_aborts(self):
         api = Api([project("P1"), project("P2"), project("P3")])
@@ -127,6 +149,64 @@ class FwfTests(unittest.TestCase):
             table = build_with(Api([project("P1", doi=False, id="projects-p 1?"), project("P2")]))
         total = json.loads(table.schema.metadata[b"openalex.funder_total"])
         self.assertEqual((table.num_rows, total["value"], total["excluded"]["no readable project code"]), (1, 2, 1))
+
+    def test_outputs_linked_from_either_side_cleaned_sorted_and_counted(self):
+        projects = [project("P1", **{"_list.connected.output": ["output-1", "output-2", "output-9"]}),
+                    project("P2", **{"_list.connected.output": []})]
+        outputs = [output(1, ["P1"], doi="https://doi.org/10.1093/GBE/evaa046", pmid="32145015", title="Zeta"),
+                   output(2, ["P1", "P2"], doi="doi:10.1063/1.5143746", pmid="PMC123"),
+                   output(3, ["F81"], doi="10.1000/sub.project"),          # a sub-project id the projects index lacks
+                   output(4, ["P2"], title="Alpha", **{"_list.author": ["Bergmeister, Stefan", "Von Haeseler A"]})]
+        with patch.object(fwf, "MAX_UNKNOWN_LINKS", 1.0):
+            table = build_with(Api(projects, outputs=outputs))
+        self.assertTrue(table.schema.equals(FWF_SCHEMA, check_metadata=False))
+        rows = {r["code"]: r for r in table.to_pylist()}
+        got = {c: [(o["output_id"], o["doi"], o["pmid"], o["surnames"]) for o in r["outputs"]] for c, r in rows.items()}
+        self.assertEqual(got, {   # sorted: DOI, PMID, title
+            "P1": [("output-2", "10.1063/1.5143746", None, ["Heid", "Boresch"]),
+                   ("output-1", "10.1093/gbe/evaa046", "32145015", ["Heid", "Boresch"])],
+            "P2": [("output-4", None, None, ["Bergmeister", "Von Haeseler"]), ("output-2", "10.1063/1.5143746", None, ["Heid", "Boresch"])]})
+        self.assertEqual(rows["P2"]["outputs"][0]["title"], "Alpha")
+        self.assertEqual(rows["P1"]["output_index_updated_at"], "2026-11-05T03:16:40Z")
+        total = json.loads(table.schema.metadata[b"openalex.funder_total"])["outputs"]
+        self.assertEqual(total, {"output index total": 4, "project-output links written": 4,
+                                 "links to a project id the projects index doesn't hold": 1,
+                                 "links to an output id the output index doesn't hold": 1})
+        table = build_with(Api(projects, outputs=outputs))               # 2 unknown of 5 links is over the 1% line:
+        self.assertEqual({r["code"]: r["outputs"] for r in table.to_pylist()}, {"P1": None, "P2": None})   # withheld,
+        self.assertIn("unknown projects", json.loads(table.schema.metadata[b"openalex.funder_total"])["outputs"]["withheld"])
+
+    def test_surnames_are_the_surname_parts_deduplicated_and_capped(self):
+        self.assertEqual(fwf.surnames(["Bergmeister, Stefan", "Heid E", "Xu N-L", "Von Haeseler A", "Thomas Müller",
+                                       "O'Brien J", "Heid, E.", " ", "Q"]),
+                         ["Bergmeister", "Heid", "Xu", "Von Haeseler", "Thomas", "Müller", "O'Brien", "Q"])
+        self.assertEqual(len(fwf.surnames([f"Author{i:03d} A" for i in range(80)])), fwf.MAX_SURNAMES)
+        self.assertIsNone(fwf.surnames(["", " "]))
+        self.assertIsNone(fwf.surnames(None))
+
+    def test_output_trouble_withholds_the_outputs_not_the_projects(self):
+        class NoOutputIndex(Api):   # /indexes lists only projects
+            def download(self, session, url, path, **kwargs):
+                super().download(session, url, path, **kwargs)
+                if urlparse(url).path == "/indexes":
+                    body = json.loads(path.read_text())
+                    path.write_text(json.dumps({"results": [i for i in body["results"] if i["uid"] == "projects"]}))
+        for api, why in ((Api([project("P1")], output_updated=("2026-11-05T03:16:40Z", "2026-11-06T03:16:40Z")), "rebuilt"),
+                         (Api([project("P1")], outputs=[]), "FWF output: empty listing"),   # an empty output index
+                         (NoOutputIndex([project("P1")]), "no output index")):
+            table = build_with(api)
+            self.assertTrue(table.schema.equals(FWF_SCHEMA, check_metadata=False))
+            rows = table.to_pylist()
+            self.assertEqual([(r["code"], r["outputs"], r["output_index_updated_at"]) for r in rows], [("P1", None, None)])
+            self.assertIn(why, json.loads(table.schema.metadata[b"openalex.funder_total"])["outputs"]["withheld"])
+
+    def test_outputs_column_matches_the_schema_and_keeps_nulls(self):
+        outputs = pa.Table.from_pylist([{"output_id": "output-1", "title": "B", "surnames": ["Heid"]},
+                                        {"output_id": "output-2", "title": "A"}], schema=pa.schema(list(FWF_OUTPUT)))
+        column = fwf.outputs_column(["P1", "P2"], {"P2": ["output-1", "output-2"]}, outputs)
+        self.assertEqual(column.type, FWF_SCHEMA.field("outputs").type)
+        self.assertEqual(column.to_pylist()[0], None)
+        self.assertEqual([(o["output_id"], o["surnames"]) for o in column.to_pylist()[1]], [("output-2", None), ("output-1", ["Heid"])])
 
 
 if __name__ == "__main__":

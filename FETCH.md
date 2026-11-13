@@ -272,8 +272,17 @@ One pass over /indexes/projects/documents, 1,000 per page, 1 s apart (21 pages);
 The projects index's updatedAt is read before and after: FWF rebuilds the index daily (~03:15 UTC) and its API ids change, so a moved stamp aborts (rerun).
 Rows are keyed on the project code (the grant DOI's suffix, P22135), first page wins, written sorted by code.
 Measured 2026-11-05: 20,600 projects, 13,834 with a PI ORCID; 22 GETs, 104 s, 51.8 MB parquet (summaries included).
+Outputs (oxjob #1765): the `output` index is harvested in the same load (153 more pages); both indexes' updatedAt must be
+the same at the start and the end. Each project gets `outputs`: the union of what either side links, with each output's
+DOI, PMID, title, type and the authors' surnames (at most 50). Each page becomes Arrow as it arrives, so no Python
+object per output is kept. Output-side trouble (the index missing, empty or
+rebuilt, or more than 1% links to ids the load doesn't hold) withholds the outputs (NULL, reason in the footer) instead of
+refusing the upload; walden's CreateFWFWorkAwards then keeps the last links. Measured 2026-11-13: 152,718 outputs,
+183,894 project-output links on 11,402 projects (243 to sub-project ids such as projects-F81); 425 s; peak RSS 412 MB, so
+it fits a standard-1X dyno (512 MB).
 Schedule (after the first manual run is checked and walden reads the prefix):
-  FWF:      `0 20 * * 1`  python -m fwf_awards   (weekly, Mondays; no --scheduled: is_due is day-1 for every source but NSF)
+  FWF:      `0 20 * * 1`  python -m fwf_awards   (weekly, Mondays; no --scheduled: is_due is day-1 for every source but NSF;
+            one-off: `heroku run:detached -a openalex-ingest python -m fwf_awards`)
 Rollback: delete the Scheduler entry, revert the commit, and delete the dated objects under awards/fwf_open_api/
   only after walden's Awards job no longer reads that prefix (an empty prefix makes the job skip FWF and fail).
 

@@ -427,6 +427,18 @@ NIH_SCHEMA = pa.schema([
 
 # FWF Open API (fwf_awards.py), frozen 2026-11-05. One row per project, keyed on code (the grant DOI's suffix).
 # The team lists are FWF's own strings ("Name, Institution (ROR), role"), kept for a later mapping change.
+# One FWF output (the Open API `output` index) as listed for a project, with what walden matches on. output_id is FWF's
+# per-load id (it changes with every daily rebuild): kept for audit only. surnames: the surname part of each author name.
+FWF_OUTPUT = pa.struct([
+    ('output_id', pa.string()),
+    ('category', pa.string()),
+    ('type', pa.string()),
+    ('doi', pa.string()),
+    ('pmid', pa.string()),
+    ('title', pa.string()),
+    ('surnames', pa.list_(pa.string())),
+])
+
 FWF_SCHEMA = pa.schema([
     ('code', pa.string()),
     ('grant_doi', pa.string()),
@@ -459,6 +471,9 @@ FWF_SCHEMA = pa.schema([
     ('n_outputs_listed', pa.int64()),
     ('index_updated_at', pa.string()),
     ('ingested_at', pa.string()),
+    # added for the grant-output links (oxjob #1765): the project's outputs from the same load, linked from either side
+    ('outputs', pa.list_(FWF_OUTPUT)),
+    ('output_index_updated_at', pa.string()),
 ])
 
 # NWO (nwo_awards.py). The first 16 columns are walden's saved laptop file (s3://openalex-ingest/awards/nwo/
