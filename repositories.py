@@ -123,7 +123,9 @@ RETRY_BLOCKED_WORKERS = 0
 ZYTE_API_URL = "https://api.zyte.com/v1/extract"
 ZYTE_TIMEOUT = (15, 120)    # Zyte solves the challenge itself; 17 s seen for a slow host
 BATCH_SIZE = 5000           # Records per S3 file
-BOT_CHALLENGE_RE = re.compile(r"anubis|making sure you(?:'|&#39;|’)re not a bot", re.I)
+# Imperva/Incapsula answers a challenge page (HTTP 200, script /_Incapsula_Resource) to some requests from our IP and
+# from Zyte's plain mode alike; a Zyte browser session passes it (KAUST, oxjob #883, 6/6 on 2026-11-15).
+BOT_CHALLENGE_RE = re.compile(r"anubis|making sure you(?:'|&#39;|’)re not a bot|_Incapsula_Resource|Incapsula incident ID", re.I)
 # Hosts whose 403s, once paced retries are spent, switch the endpoint to Zyte (an IP block, not
 # Cloudflare). HAL: Jason, 2026-10-08 (oxjob #1588): "If we start getting blocked, I would like to
 # switch to Zyte" rather than wait for HAL to allowlist our static IP.
