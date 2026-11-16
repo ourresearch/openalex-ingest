@@ -547,11 +547,8 @@ class EndpointHarvester:
                 raise
 
     def call_pmh_endpoint(self, s3_client, s3_bucket, first, last):
-        until_date = format_oai_datestamp(last, self.date_format)
-
         args = {
             'metadataPrefix': self.state.metadata_prefix,
-            'until': until_date
         }
 
         # No 'from' on a first harvest. Identify's earliestDatestamp is not a safe
@@ -564,12 +561,20 @@ class EndpointHarvester:
         # the newest date and a failed run would skip everything older on the next day.
         # So a first harvest persists no checkpoint until the walk completes, and then
         # writes the max datestamp it saw. A failed first harvest restarts from scratch.
+        #
+        # No 'until' on a first harvest either (oxjob #832). Some DSpace feeds keep a broken date index:
+        # they serve every record to an undated ListRecords but answer any date argument with
+        # noRecordsMatch (UCA riuca, Volyn evnuir) or a small recent subset (RepositorioTEC: 2,000 of
+        # 11,917), so a first harvest bounded by 'until' got 0 records and the endpoint stayed empty.
+        # The final checkpoint is capped at 'last' below, so a record stamped today (or a future-dated
+        # one) can't move it past where the next daily run starts.
         first_harvest = first is None
         max_date_key = None
         min_date_key = None
         deadline = time() + FIRST_HARVEST_DEADLINE_SECONDS if first_harvest else None
         if not first_harvest:
             args['from'] = format_oai_datestamp(first, self.date_format)
+            args['until'] = format_oai_datestamp(last, self.date_format)
 
         if self.state.pmh_set:
             args["set"] = self.state.pmh_set
@@ -735,7 +740,7 @@ class EndpointHarvester:
             # First harvest: the walk completed, so the max datestamp seen is safe. Any other completed
             # walk covered every record up to 'last'; on an ordered feed the last date walked says so too.
             if first_harvest:
-                final_date = max_date_key
+                final_date = min(max_date_key, last.isoformat()[:10]) if max_date_key else None
             elif in_order:
                 final_date = current_date_processing
             else:
