@@ -7,6 +7,7 @@ import time
 import boto3
 import requests
 import sentry_sdk
+from urllib.parse import quote
 from tenacity import retry, stop_after_delay, wait_exponential, retry_if_exception_type
 
 from common import S3_BUCKET, LOGGER
@@ -113,7 +114,8 @@ def fmt_hour(hour):
 
 
 def pull_hour(hour, on_page):
-    """Pull every record Crossref indexed in this hour; restart the hour from its first page if a page keeps failing."""
+    """Pull every record Crossref indexed in this hour; restart the hour from its first page if a page keeps failing,
+    and if it still fails, fetch the hour's records by DOI so one record Crossref can't serve doesn't stop the rest."""
     filter_params = (f'from-index-date:{hour:%Y-%m-%dT%H}:00:00,'
                      f'until-index-date:{hour:%Y-%m-%dT%H}:59:59')
     for attempt in range(1, HOUR_ATTEMPTS + 1):
@@ -121,9 +123,58 @@ def pull_hour(hour, on_page):
             return get_crossref_data(filter_params, f'crossref/updates/{hour:%Y/%m/%d}', f'works_{hour:%H}', on_page)
         except requests.exceptions.RequestException as e:
             if attempt == HOUR_ATTEMPTS:
-                raise
+                LOGGER.warning(f"Hour {fmt_hour(hour)} failed {attempt} times ({e}); fetching it by DOI.")
+                return pull_hour_by_doi(hour, filter_params, on_page)
             LOGGER.warning(f"Hour {fmt_hour(hour)} failed ({e}); restarting it (attempt {attempt + 1}).")
             time.sleep(60)
+
+
+def fetch_quick(url):
+    for attempt in range(3):
+        try:
+            response = http.get(url, timeout=120)
+            response.raise_for_status()
+            return response.json()['message']
+        except requests.exceptions.RequestException:
+            if attempt == 2:
+                raise
+            time.sleep(5)
+
+
+def fetch_records(dois):
+    """Full records for these DOIs; halve the batch on an error, and skip (with a Sentry event) one DOI Crossref can't serve."""
+    try:
+        if len(dois) == 1:
+            return [fetch_quick(f'https://api.crossref.org/works/{quote(dois[0], safe="")}')]
+        doi_filter = ','.join(f'doi:{quote(d, safe="/")}' for d in dois)
+        items = fetch_quick(f'https://api.crossref.org/works?filter={doi_filter}&rows={len(dois)}')['items']
+        returned = {item['DOI'].lower() for item in items}
+        missing = [d for d in dois if d.lower() not in returned]  # e.g. a DOI with a comma splits the filter
+        return items + [item for d in missing for item in fetch_records([d])]
+    except requests.exceptions.RequestException as e:
+        if len(dois) == 1:
+            sentry_sdk.capture_message(f"Crossref can't serve {dois[0]} ({e}); skipped", level='error')
+            return []
+        half = len(dois) // 2
+        return fetch_records(dois[:half]) + fetch_records(dois[half:])
+
+
+def pull_hour_by_doi(hour, filter_params, on_page):
+    dois, cursor = [], '*'
+    while cursor:
+        message = make_request_with_retry(
+            f'https://api.crossref.org/works?filter={filter_params}&select=DOI&rows=1000&cursor={cursor}').json()['message']
+        dois += [item['DOI'] for item in message['items']]
+        cursor = message.get('next-cursor') if message['items'] else None
+    fetched = 0
+    for page_number, start in enumerate(range(0, len(dois), 100), 1):
+        items = fetch_records(dois[start:start + 100])
+        if items:
+            save_to_s3(items, f'crossref/updates/{hour:%Y/%m/%d}/works_{hour:%H}_by_doi_page_{page_number}_{datetime.datetime.now().isoformat()}.json')
+        fetched += len(items)
+        on_page()
+    LOGGER.info(f"Hour {fmt_hour(hour)} by DOI: {fetched} of {len(dois)} records.")
+    return fetched
 
 
 def pull_updates(start, end, checkpoint):
