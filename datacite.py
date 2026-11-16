@@ -181,18 +181,26 @@ def held_ids(day):
 
 
 def listed_ids(day):
-    """Every DOI whose `updated` falls on the day, ids only; fails if the listing comes back short."""
+    """Every DOI whose `updated` falls on the day, ids only. A listing that ends short asks for its last page again
+    (the cursor is the last record's sort key, so the same link resumes); fails if it stays short."""
     query = window(day, day + datetime.timedelta(days=1, seconds=-1))
     url = f"{BASE_URL}?page[cursor]=1&page[size]={BATCH_SIZE}&query={query}&fields[dois]=updated"
-    ids = []
-    while url:
+    ids, attempt = set(), 0
+    while True:
         data = get_json(url)
-        ids.extend(d["id"].lower() for d in data.get("data", []))
-        url = data.get("links", {}).get("next")
-    expected = count(query)
-    if len(ids) < expected:
-        raise RuntimeError(f"DataCite listing of {day:%Y-%m-%d} came back short: {len(ids)} of {expected}")
-    return ids
+        ids.update(d["id"].lower() for d in data.get("data", []))
+        next_url = data.get("links", {}).get("next")
+        if next_url:
+            url = next_url
+            continue
+        expected = count(query)
+        if len(ids) >= expected:
+            return ids
+        attempt += 1
+        if attempt == HOUR_ATTEMPTS:
+            raise RuntimeError(f"DataCite listing of {day:%Y-%m-%d} came back short: {len(ids)} of {expected}")
+        LOGGER.warning(f"Listing of {day:%Y-%m-%d} stopped at {len(ids)} of {expected}; asking for that page again.")
+        time.sleep(60)
 
 
 def recheck_day(day):

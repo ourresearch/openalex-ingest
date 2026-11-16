@@ -142,6 +142,26 @@ class DataCiteHarvestTest(unittest.TestCase):
         self.assertEqual((fetched, again), (150, 0))
         self.assertEqual(sorted(s3_ids(self.s3)), sorted(records))
 
+    def test_listing_that_stops_short_resumes_from_its_last_page(self):
+        records = [f"10.1/{i:04d}" for i in range(2500)]
+        cut = {"done": False}
+
+        def api(url, params=None):
+            if params:   # count
+                return {"meta": {"total": len(records)}}
+            offset = int(url.split("page[cursor]=")[1].split("&")[0]) - 1
+            page = records[offset:offset + 1000]
+            if offset == 1000 and not cut["done"]:   # DataCite ends the listing mid-way once
+                cut["done"] = True
+                return {"data": [{"id": d} for d in page[:400]], "links": {}}
+            links = {"next": f"x?page[cursor]={offset + 1001}&q"} if offset + 1000 < len(records) else {}
+            return {"data": [{"id": d} for d in page], "links": links}
+
+        with patch.object(D, "get_json", api):
+            ids = D.listed_ids(datetime.datetime(2025, 12, 17, tzinfo=UTC))
+        self.assertTrue(cut["done"])
+        self.assertEqual(ids, {d.lower() for d in records})
+
     def test_one_failed_recheck_day_does_not_stop_the_others(self):
         done = []
 
