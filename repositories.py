@@ -42,7 +42,7 @@ PARALLELIZATION:
 - Uses ThreadPoolExecutor with 100 concurrent workers; a plain 403 paces the host and gets one retry;
   Cloudflare challenges switch the endpoint to Zyte (oxjob #1425)
 - Rate-limited to max 3 concurrent requests per host (prevents overloading)
-- 30-second connect / 60-second read timeout per request (oxjob #1425 H2, H2b)
+- 30-second connect / 60-second read timeout per request (oxjob #1425 H2, H2b); slow hosts get longer (TIMEOUT_BY_URL_PART)
 - Endpoints flagged fetch_via_zyte are fetched through the Zyte API (plain mode); a Cloudflare
   challenge on a direct request flags the endpoint automatically (oxjob #1425; needs ZYTE_API_KEY)
 - Total runtime: ~15 minutes for all ~5,000 endpoints
@@ -103,6 +103,15 @@ REQUEST_TIMEOUT = 30        # Connect timeout (seconds); Python counts the TLS h
 # page; at 15 s they failed every night while dead hosts still fail fast on connect
 # (oxjob #1425 H2: 9 OJS feeds, 13K held records, plus 3 new #1417 feeds).
 READ_TIMEOUT = 60
+# (connect, read) timeouts for hosts that answer slower than READ_TIMEOUT, keyed by a piece of the OAI URL.
+TIMEOUT_BY_URL_PART = {
+    'osti.gov/oai': (30, 300),
+    'irdb.nii.ac.jp': (120, 600),
+    # Engineering Transactions: ~100 s per OAI response from the harvester (oxjob #1407/#1417)
+    'et.ippt.pan.pl': (60, 300),
+    # IRUA (University of Antwerp): 88-115 s for the first ListRecords page from 2002 on, ~6 s for each page after (oxjob #227)
+    'repository.uantwerpen.be/oai': (REQUEST_TIMEOUT, 300),
+}
 # A plain 403 (not a Cloudflare challenge, which switches the endpoint to Zyte) paces the host
 # (one request every SLOW_HOST_INTERVAL s, doubling per further 403) and gets one retry after
 # BLOCKED_RETRY_WAITS. Measured 2026-10-03/04 (oxjob #1425): 5 of 644 non-Cloudflare 403s
@@ -1147,13 +1156,9 @@ class MySickle(Sickle):
         self.zyte_adopted = False
         self.zyte_session_init_url = None  # set when a bot-challenge page is met (see zyte_get)
         kwargs['max_retries'] = kwargs.get('max_retries', 3)
-        if 'osti.gov/oai' in args[0]:
-            kwargs['timeout'] = (30, 300)
-        if 'irdb.nii.ac.jp' in args[0]:
-            kwargs['timeout'] = (120, 600)
-        if 'et.ippt.pan.pl' in args[0]:
-            # Engineering Transactions: ~100 s per OAI response from the harvester (oxjob #1407/#1417)
-            kwargs['timeout'] = (60, 300)
+        for url_part, timeout in TIMEOUT_BY_URL_PART.items():
+            if url_part in args[0]:
+                kwargs['timeout'] = timeout
         self.logger = get_thread_logger()
         super(MySickle, self).__init__(*args, **kwargs)
 

@@ -153,5 +153,39 @@ class EmptyWindowAs404(unittest.TestCase):
                 sickle.GetRecord(identifier="oai:pubmedcentral.nih.gov:99999999999", metadataPrefix="oai_dc")
 
 
+class SlowHostTimeouts(unittest.TestCase):
+    """The (connect, read) timeout each request goes out with (oxjob #227: IRUA needs ~90 s for an old window)."""
+
+    def sent_timeout(self, url):
+        import requests
+        from sickle.oaiexceptions import NoRecordsMatch
+        seen = {}
+        resp = requests.Response()
+        resp.status_code, resp.url, resp.encoding = 200, url, "utf-8"
+        resp._content = (b'<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+                         b'<responseDate>2026-11-17T14:00:00Z</responseDate><request>x</request>'
+                         b'<error code="noRecordsMatch">none</error></OAI-PMH>')
+
+        def fake_request(method, u, **kwargs):
+            seen.update(kwargs)
+            return resp
+
+        with patch.object(R, "_tls_tolerant_request", fake_request):
+            with self.assertRaises(NoRecordsMatch):
+                R._get_my_sickle(url).ListRecords(metadataPrefix="oai_dc", **{"from": "2002-12-31"})
+        return seen["timeout"]
+
+    def test_irua_gets_a_300_s_read_timeout(self):
+        self.assertEqual(self.sent_timeout("https://repository.uantwerpen.be/oai/abua/server.phtml"),
+                         (R.REQUEST_TIMEOUT, 300))
+
+    def test_other_slow_hosts_keep_theirs(self):
+        self.assertEqual(self.sent_timeout("https://et.ippt.pan.pl/index.php/et/oai"), (60, 300))
+        self.assertEqual(self.sent_timeout("https://www.osti.gov/oai"), (30, 300))
+
+    def test_any_other_host_gets_the_default(self):
+        self.assertEqual(self.sent_timeout("https://repo.example.org/oai"), (R.REQUEST_TIMEOUT, R.READ_TIMEOUT))
+
+
 if __name__ == "__main__":
     unittest.main()
