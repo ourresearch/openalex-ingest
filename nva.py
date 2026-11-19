@@ -52,6 +52,11 @@ AUTHOR_ROLES = ("Creator", "Artist")
 # The one it spells differently: Dutch, which it knows as the bibliographic 'dut'.
 LANGUAGE = {"nld": "nl"}
 HANDLE = re.compile(r"hdl\.handle\.net/(\d[\d.]*/\d+)")
+# Characters XML 1.0 forbids (C0 controls but tab, newline and CR; U+FFFE/U+FFFF; lone surrogates). ElementTree writes
+# them without complaint, and the harvester's parser then rejects the record and stops the run: 55 of the 319,472 NVA
+# theses carry one, mostly U+0002 pasted into an abstract, and the first harvest died on the first of them (19 Nov).
+# The OAI path strips the C0 ones from each response (repositories._XML_BAD_CTRL); here each value is cleaned.
+XML_INVALID = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff￾￿]")
 
 
 def nva_record(hit):
@@ -95,8 +100,9 @@ def to_oai_record(hit, stamp=None):
     dc = ET.SubElement(ET.SubElement(rec, f"{{{OAI_NS}}}metadata"), f"{{{OAI_DC_NS}}}dc")
 
     def add(tag, value):
-        if value is not None and str(value).strip():
-            ET.SubElement(dc, f"{{{DC_NS}}}{tag}").text = str(value).strip()
+        value = XML_INVALID.sub("", str(value)).strip() if value is not None else ""
+        if value:
+            ET.SubElement(dc, f"{{{DC_NS}}}{tag}").text = value
 
     add("title", ed.get("mainTitle"))
     people = sorted(ed.get("contributors") or [], key=_sequence)

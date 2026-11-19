@@ -123,6 +123,17 @@ def test_record_survives_harvester_serialisation():
     assert "<ns0:record>" in xml and "<ns1:dc>" in xml and "<dc:creator>" in xml
 
 
+def test_characters_xml_forbids_are_dropped_so_the_record_still_parses():
+    """An abstract with a pasted U+0002 stopped the first NVA harvest: save_batch could not parse the record."""
+    import defusedxml.ElementTree as DefusedET
+    h = hit()
+    h["entityDescription"]["abstract"] = "We genotyped\x02 2,000\x1f fish.￾"
+    h["entityDescription"]["mainTitle"] = "Genomic\x0e monitoring\tof Atlantic halibut"
+    elem = DefusedET.fromstring(nva.nva_record(h).raw)
+    assert elem.find(f".//{DC}description").text == "We genotyped 2,000 fish."
+    assert elem.find(f".//{DC}title").text == "Genomic monitoring\tof Atlantic halibut"  # tab is legal XML
+
+
 class FakeResponse:
     def __init__(self, payload, status=200):
         self.payload, self.status_code, self.text = payload, status, ""
