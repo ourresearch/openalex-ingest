@@ -112,6 +112,9 @@ TIMEOUT_BY_URL_PART = {
     'et.ippt.pan.pl': (60, 300),
     # IRUA (University of Antwerp): 88-115 s for the first ListRecords page from 2002 on, ~6 s for each page after (oxjob #227)
     'repository.uantwerpen.be/oai': (REQUEST_TIMEOUT, 300),
+    # Wageningen (library.wur.nl): some oai_openaire ListRecords pages took over 30 s through the egress proxy; its
+    # first full harvest died there after 187,600 of ~394K records (oxjob #2429)
+    'library.wur.nl/oai': (120, 300),
 }
 # A plain 403 (not a Cloudflare challenge, which switches the endpoint to Zyte) paces the host
 # (one request every SLOW_HOST_INTERVAL s, doubling per further 403) and gets one retry after
