@@ -166,6 +166,9 @@ BATCH_SIZE_BY_ENDPOINT = {"hal_tei": 1000}
 # (~4,770 authors, 1.56 MB of TEI each) on 2026-09-13: 1,000 of them would be a ~1.5 GB file, more than
 # HalTei.py's parser UDF can return as one value (oxjob #1588, 2026-10-10).
 BATCH_BYTES_BY_ENDPOINT = {"hal_tei": 32_000_000}
+# The same cap by metadata format: Repo.py's openaire flow parses each file in one Python UDF call, up to 100 files a
+# batch, so oai_openaire files stay small (a record is ~3 KB: ~1,300 records a file; oxjob #2429).
+BATCH_BYTES_BY_PREFIX = {"oai_openaire": 4_000_000}
 # A single record bigger than this is pathological: it goes to oversize/<endpoint id>/YYYY/MM/DD/ on its own,
 # never into the endpoint's normal files, and is logged and counted (Jason, 2026-10-10, oxjob #1588). The
 # biggest HAL TEI record seen is 1.56 MB.
@@ -502,10 +505,11 @@ class EndpointHarvester:
     def __init__(self, endpoint: Endpoint, db_session, batch_size=BATCH_SIZE):
         self.state = endpoint
         self.batch_size = BATCH_SIZE_BY_ENDPOINT.get(endpoint.id, batch_size)
-        self.batch_bytes = BATCH_BYTES_BY_ENDPOINT.get(endpoint.id, math.inf)
+        self.batch_bytes = BATCH_BYTES_BY_ENDPOINT.get(endpoint.id,
+                                                       BATCH_BYTES_BY_PREFIX.get(endpoint.metadata_prefix, math.inf))
         self.max_record_bytes = MAX_RECORD_BYTES_BY_ENDPOINT.get(endpoint.id, math.inf)
         # sickle's record.raw re-serializes the record on every read: measure only where a cap is set
-        self.measure_bytes = endpoint.id in BATCH_BYTES_BY_ENDPOINT or endpoint.id in MAX_RECORD_BYTES_BY_ENDPOINT
+        self.measure_bytes = self.batch_bytes != math.inf or endpoint.id in MAX_RECORD_BYTES_BY_ENDPOINT
         self.db = db_session
         self.error = None
         self.metrics = MetricsLogger()

@@ -28,5 +28,23 @@ class S3Folder(unittest.TestCase):
         self.assertEqual(R.s3_folder(ep("irdb_nii_ac_jp", "jpcoar_2.0")), "irdb")
 
 
+class BatchBytes(unittest.TestCase):
+    def harvester(self, id, prefix):
+        return R.EndpointHarvester(SimpleNamespace(id=id, metadata_prefix=prefix, fetch_via_zyte=False), db_session=None)
+
+    def test_oai_openaire_files_are_capped(self):
+        h = self.harvester("0a26303df1172c2974a", "oai_openaire")
+        self.assertEqual(h.batch_bytes, 4_000_000)
+        self.assertTrue(h.measure_bytes)
+
+    def test_oai_dc_is_not_capped_or_measured(self):
+        h = self.harvester("0a26303df1172c2974a", "oai_dc")
+        self.assertEqual(h.batch_bytes, float("inf"))
+        self.assertFalse(h.measure_bytes)
+
+    def test_hal_tei_keeps_its_own_cap(self):
+        self.assertEqual(self.harvester("hal_tei", "xml-tei").batch_bytes, 32_000_000)
+
+
 if __name__ == "__main__":
     unittest.main()
