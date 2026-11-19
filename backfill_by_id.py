@@ -23,7 +23,8 @@ from urllib.parse import urlparse
 from sickle.oaiexceptions import IdDoesNotExist
 
 from common import S3_BUCKET, Session
-from repositories import EndpointHarvester, StateManager, _get_my_sickle, _get_shared_s3_client, host_rate_limiter
+from repositories import (NVA_SEARCH_ENDPOINTS, EndpointHarvester, StateManager, _get_my_sickle, _get_shared_s3_client,
+                          host_rate_limiter)
 
 TRIES_PER_ID = 3
 
@@ -59,6 +60,9 @@ def main():
         endpoint = StateManager.get_endpoint(args.endpoint_id, session)
         if not endpoint:
             raise SystemExit(f"No endpoint with id {args.endpoint_id}")
+        if endpoint.id in NVA_SEARCH_ENDPOINTS:
+            # its OAI GetRecord serves supervisors as contributors and no author (nva.py): re-harvest a window instead
+            raise SystemExit(f"{endpoint.id} is read from NVA's search API: use repositories.py --start-date")
         harvester = EndpointHarvester(endpoint, session)   # only its save_batch is used: no checkpoint, no health
         prefix = endpoint.metadata_prefix
         sickle = _get_my_sickle(endpoint.pmh_url)

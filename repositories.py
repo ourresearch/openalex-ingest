@@ -89,6 +89,7 @@ import tenacity
 import xml.etree.ElementTree as ET
 
 from common import Base, LOGGER, S3_BUCKET, Session, db
+import nva
 
 
 # =============================================================================
@@ -144,6 +145,9 @@ ZYTE_AFTER_403_HOSTS = {"api.archives-ouvertes.fr"}
 # HAL in xml-tei -> HalTei.py (oxjob #1588; under repositories/ it would collide with the oai_dc HAL rows,
 # same OAI ids and datestamps).
 OWN_S3_FOLDER = {"irdb_nii_ac_jp": "irdb", "hal_tei": "hal-tei"}
+# Endpoints read from NVA's search API instead of their OAI feed, whose oai_dc names supervisors as contributors and
+# no author (nva.py, oxjob #2380). pmh_set holds the NVA instance types; records land as oai_dc under repositories/.
+NVA_SEARCH_ENDPOINTS = {"nva_sikt"}
 # Smaller S3 batches where records are big: the buffer holds parsed records, and a HAL TEI record is
 # ~26 KB of XML (oxjob #1588).
 BATCH_SIZE_BY_ENDPOINT = {"hal_tei": 1000}
@@ -609,20 +613,25 @@ class EndpointHarvester:
         undated_key = (last or datetime.now(timezone.utc).date()).isoformat()
 
         try:
-            my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics,
-                                       fetch_via_zyte=bool(self.state.fetch_via_zyte),
-                                       on_zyte_adopted=self._adopt_zyte)
-            my_sickle.deadline = deadline  # MySickle stops retrying/sleeping past it
-            records = self._make_oai_request(my_sickle, **args)
+            if self.state.id in NVA_SEARCH_ENDPOINTS:
+                records = nva.NvaRecords(self.state.pmh_set, first=first, last=None if first_harvest else last,
+                                         deadline=deadline, deadline_error=FirstHarvestDeadline)
+                self.metrics.total_records = records.total
+            else:
+                my_sickle = _get_my_sickle(self.state.pmh_url, metrics_logger=self.metrics,
+                                           fetch_via_zyte=bool(self.state.fetch_via_zyte),
+                                           on_zyte_adopted=self._adopt_zyte)
+                my_sickle.deadline = deadline  # MySickle stops retrying/sleeping past it
+                records = self._make_oai_request(my_sickle, **args)
 
-            if hasattr(records._items, 'oai_response'):
-                resumption_token_element = records._items.oai_response.xml.find(
-                    './/' + records._items.sickle.oai_namespace + 'resumptionToken')
-                if resumption_token_element is not None:
-                    complete_list_size = resumption_token_element.attrib.get('completeListSize')
-                    if complete_list_size:
-                        self.metrics.total_records = int(complete_list_size)
-                        self.logger.info(f"Total records to harvest: {self.metrics.total_records}")
+                if hasattr(records._items, 'oai_response'):
+                    resumption_token_element = records._items.oai_response.xml.find(
+                        './/' + records._items.sickle.oai_namespace + 'resumptionToken')
+                    if resumption_token_element is not None:
+                        complete_list_size = resumption_token_element.attrib.get('completeListSize')
+                        if complete_list_size:
+                            self.metrics.total_records = int(complete_list_size)
+                            self.logger.info(f"Total records to harvest: {self.metrics.total_records}")
 
             # Group records by date
             records_by_date = {}
