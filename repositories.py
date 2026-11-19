@@ -145,6 +145,17 @@ ZYTE_AFTER_403_HOSTS = {"api.archives-ouvertes.fr"}
 # HAL in xml-tei -> HalTei.py (oxjob #1588; under repositories/ it would collide with the oai_dc HAL rows,
 # same OAI ids and datestamps).
 OWN_S3_FOLDER = {"irdb_nii_ac_jp": "irdb", "hal_tei": "hal-tei"}
+# The same by metadata format: an endpoint switched to oai_openaire (OpenAIRE Guidelines v4, which carry the COAR access
+# right and the file URLs that many repositories leave out of oai_dc) lands in openaire/<endpoint id>/, read by Repo.py's
+# openaire flow (oxjob #2429). The endpoint keeps its id, so its records keep their sources and works.
+PREFIX_S3_FOLDER = {"oai_openaire": "openaire"}
+
+
+def s3_folder(endpoint):
+    """Where an endpoint's harvested files go: its own folder, else its format's, else repositories/<id>."""
+    if endpoint.id in OWN_S3_FOLDER:
+        return OWN_S3_FOLDER[endpoint.id]
+    return f"{PREFIX_S3_FOLDER.get(endpoint.metadata_prefix, 'repositories')}/{endpoint.id}"
 # Endpoints read from NVA's search API instead of their OAI feed, whose oai_dc names supervisors as contributors and
 # no author (nva.py, oxjob #2380). pmh_set holds the NVA instance types; records land as oai_dc under repositories/.
 NVA_SEARCH_ENDPOINTS = {"nva_sikt"}
@@ -852,7 +863,7 @@ class EndpointHarvester:
                 ("".join(record_ids) + "".join(record_bodies)).encode()
             ).hexdigest()[:12]
             if folder is None:
-                folder = OWN_S3_FOLDER.get(self.state.id, f"repositories/{self.state.id}")
+                folder = s3_folder(self.state)
             object_key = f"{folder}/{date_path}/{content_hash}.xml.gz"
 
             try:
