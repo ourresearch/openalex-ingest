@@ -152,12 +152,29 @@ OWN_S3_FOLDER = {"irdb_nii_ac_jp": "irdb", "hal_tei": "hal-tei"}
 # right and the file URLs that many repositories leave out of oai_dc) lands in openaire/<endpoint id>/, read by Repo.py's
 # openaire flow (oxjob #2429). The endpoint keeps its id, so its records keep their sources and works.
 PREFIX_S3_FOLDER = {"oai_openaire": "openaire"}
+# Repo.py's openaire flow reads all of openaire/ and replaces each record's oai_dc row, so a feed goes there only after
+# its dry run passed (oxjob #2429 ACCEPTANCE Test 3: some feeds' oai_openaire drops DOIs, dates or titles that their
+# oai_dc carries). Any other endpoint switched to oai_openaire lands in openaire-trial/<id>/, which nothing in
+# production reads: the dry run reads it there, and promoting a feed = adding its id here and moving its files to
+# openaire/<id>/compacted/ (oxjobs openaire-format-repository-feeds work/compact_openaire.py --from openaire-trial).
+OPENAIRE_LIVE_ENDPOINTS = {
+    "0a26303df1172c2974a",  # Wageningen
+    "aeb030e0234929b4830",  # Leiden
+    "8dmo9jkujeyhzpu5sk6f",  # Montreal
+    "zr8qlro9rnbj2bazpzzj",  # CWI
+    "dz4r5qndbjwd5pdjylfa",  # Naturalis
+    "4b568bea06eedf698a1",  # Aston (cgi)
+    "0e7511e16a13645b5be",  # Aston (perl twin)
+}
+OPENAIRE_TRIAL_FOLDER = "openaire-trial"
 
 
 def s3_folder(endpoint):
     """Where an endpoint's harvested files go: its own folder, else its format's, else repositories/<id>."""
     if endpoint.id in OWN_S3_FOLDER:
         return OWN_S3_FOLDER[endpoint.id]
+    if endpoint.metadata_prefix == "oai_openaire" and endpoint.id not in OPENAIRE_LIVE_ENDPOINTS:
+        return f"{OPENAIRE_TRIAL_FOLDER}/{endpoint.id}"
     return f"{PREFIX_S3_FOLDER.get(endpoint.metadata_prefix, 'repositories')}/{endpoint.id}"
 # Endpoints read from NVA's search API instead of their OAI feed, whose oai_dc names supervisors as contributors and
 # no author (nva.py, oxjob #2380). pmh_set holds the NVA instance types; records land as oai_dc under repositories/.

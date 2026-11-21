@@ -23,6 +23,14 @@ class S3Folder(unittest.TestCase):
     def test_oai_openaire_gets_its_own_folder(self):
         self.assertEqual(R.s3_folder(ep("0a26303df1172c2974a", "oai_openaire")), "openaire/0a26303df1172c2974a")
 
+    def test_unreviewed_oai_openaire_feed_lands_in_trial(self):
+        # switched but not yet through its dry run: nothing in production reads openaire-trial/
+        self.assertEqual(R.s3_folder(ep("83acdeb0a2b75a2e162", "oai_openaire")), "openaire-trial/83acdeb0a2b75a2e162")
+
+    def test_live_list_only_matters_for_oai_openaire(self):
+        # a live endpoint switched back to oai_dc goes under repositories/ again
+        self.assertEqual(R.s3_folder(ep("0a26303df1172c2974a", "oai_dc")), "repositories/0a26303df1172c2974a")
+
     def test_own_folder_wins(self):
         self.assertEqual(R.s3_folder(ep("hal_tei", "xml-tei")), "hal-tei")
         self.assertEqual(R.s3_folder(ep("irdb_nii_ac_jp", "jpcoar_2.0")), "irdb")
