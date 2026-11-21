@@ -181,3 +181,31 @@ def test_deadline_raises_the_callers_error():
         pass
     with pytest.raises(Deadline):
         nva.NvaRecords("DegreePhd", deadline=0, deadline_error=Deadline, session=FakeSession([]))
+
+
+def _file(identifier, mime="application/pdf", size="1000", version=None, **over):
+    f = {"type": "OpenFile", "identifier": identifier, "mimeType": mime, "size": size, "publisherVersion": version,
+         "license": {"type": "License", "value": "https://creativecommons.org/licenses/by/4.0"}}
+    f.update(over)
+    return f
+
+
+def test_main_pdf_file_link_comes_first_typed_pdf():
+    _, dc = parse(hit(associatedArtifacts=[_file("f-1")]))
+    assert dc["identifier"][0] == hit()["id"] + "/filelink/f-1 (application/pdf)"
+    # the landing page is still the first identifier without a file link: the handle
+    assert [i for i in dc["identifier"] if "filelink" not in i][0] == "https://hdl.handle.net/11250/228842"
+
+
+def test_file_link_prefers_a_versioned_pdf_then_the_largest_and_skips_other_files():
+    files = [_file("video", mime="video/mp4", size="999999999"), _file("songbook", size="93891"),
+             _file("thesis", size="29046950"), _file("hidden", size="99999999", type="HiddenFile")]
+    assert parse(hit(associatedArtifacts=files))[1]["identifier"][0].startswith(hit()["id"] + "/filelink/thesis ")
+    files.append(_file("accepted", size="10", version="AcceptedVersion"))
+    assert parse(hit(associatedArtifacts=files))[1]["identifier"][0].startswith(hit()["id"] + "/filelink/accepted ")
+
+
+def test_no_file_link_without_an_open_unembargoed_pdf():
+    later = date.today().replace(year=date.today().year + 1).isoformat() + "T00:00:00Z"
+    for files in ([], [_file("v", mime="video/mp4")], [_file("e", embargoDate=later)]):
+        assert not any("filelink" in i for i in parse(hit(associatedArtifacts=files))[1]["identifier"])

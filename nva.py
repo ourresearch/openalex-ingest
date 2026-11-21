@@ -12,7 +12,7 @@ The endpoint row's pmh_set holds the NVA instance types to read, comma-separated
 A window is read by modification date; NVA's search index holds published records only, so a record NVA unpublishes is
 never seen again (its OAI feed reports no deletions either).
 """
-from datetime import timedelta
+from datetime import date, timedelta
 from time import sleep, time
 from types import SimpleNamespace
 import logging
@@ -78,6 +78,27 @@ def _sequence(contributor):
         return 0
 
 
+def _size(f):
+    try:
+        return int(f.get("size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _file_link(hit):
+    """The file link of the record's main public PDF, which Taxicab follows to the file (NVA serves files only through
+    short-lived presigned URLs). Among the open, unembargoed PDFs: one with a stated version, else the largest (artistic
+    PhDs list songbooks and catalogues beside the thesis)."""
+    today = date.today().isoformat()
+    pdfs = [f for f in hit.get("associatedArtifacts") or []
+            if f.get("type") == "OpenFile" and f.get("identifier") and "pdf" in (f.get("mimeType") or "").lower()
+            and not (f.get("embargoDate") or "") > today]
+    if not pdfs:
+        return None
+    main = max(pdfs, key=lambda f: (f.get("publisherVersion") is not None, _size(f)))
+    return f"{hit['id']}/filelink/{main['identifier']}"
+
+
 def _handle(hit):
     """The record's landing handle: Brage's own (the one NORA and Brage copies carry), else the one NVA minted."""
     found = [(a.get("sourceName") or "", m.group(1)) for a in hit.get("additionalIdentifiers") or []
@@ -129,6 +150,12 @@ def to_oai_record(hit, stamp=None):
         add("date", "-".join(parts))
     add("type", EU_REPO_TYPE.get(itype))
     add("type", itype)
+    # The main PDF's file link comes first: TaxiCab fetches a record's first 3 URLs (a DOI and the two pages below
+    # already fill them). Repo.py types it pdf from the "(application/pdf)" note, so the landing page stays the first
+    # html URL, the handle; CreateSuperLocations keeps the link itself out of pdf_url (it answers JSON).
+    file_link = _file_link(hit)
+    if file_link:
+        add("identifier", f"{file_link} (application/pdf)")
     handle = _handle(hit)
     if handle:
         add("identifier", f"https://hdl.handle.net/{handle}")
