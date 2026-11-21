@@ -1274,7 +1274,8 @@ class MySickle(Sickle):
         LOGGER.warning(f"Stripped {blocks} PHP notice(s) before the XML declaration from {self.endpoint}")
 
     def harvest(self, **kwargs):
-        headers = {'User-Agent': 'OpenAlexHarvester/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
+        # no 'Harvester' in the name: bad-bot filters read it as an email harvester (oxjob #2348, 117 of 143 blocking sites)
+        headers = {'User-Agent': 'OpenAlex/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
         retry_wait = self.DEFAULT_RETRY_SECONDS
         attempt = 0
         blocked_attempts = 0

@@ -25,7 +25,7 @@ from sickle.oaiexceptions import NoRecordsMatch
 LOGGER = logging.getLogger('openalex-ingest')  # common.py's logger, without importing common (it needs the database)
 
 SEARCH_URL = "https://api.nva.unit.no/search/resources"
-USER_AGENT = "OpenAlexHarvester/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)"
+USER_AGENT = "OpenAlex/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)"
 PAGE_SIZE = 100  # the API's maximum
 OAI_NS = "http://www.openarchives.org/OAI/2.0/"
 OAI_DC_NS = "http://www.openarchives.org/OAI/2.0/oai_dc/"
