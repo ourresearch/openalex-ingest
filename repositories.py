@@ -1075,6 +1075,12 @@ class ZyteBan(Exception):
     """Zyte API 520: it could not get a ban-free response from the site. Not retried."""
 
 
+class ZyteSessionExpired(requests.exceptions.ConnectionError):
+    """Zyte API 422 "Session has expired": Zyte retires a session after a while, so a long walk
+    outlives it (oxjob #883: a ~74K-record feed died at the same resumptionToken every day).
+    zyte_get opens a new session and retries the same URL; uncaught it is a connection_error as before."""
+
+
 def zyte_available() -> bool:
     if os.getenv("ZYTE_API_KEY"):
         return True
@@ -1112,7 +1118,8 @@ def zyte_get(url: str, headers: dict, session_init_url: Optional[str] = None) ->
     challenge page). The request then runs in a Zyte session, one per host, opened by a single browser
     visit to that URL; plain fetches in that session return the real raw body (tested on hal.science,
     oxjob #1588). Not Zyte's self-managed sessions with an opening action: those return the opening
-    page for every URL. A session that meets the wall again is reopened once.
+    page for every URL. A session that meets the wall again, or that Zyte says has expired, is
+    reopened once and the same URL (same resumptionToken) fetched again.
 
     Returns a requests.Response carrying the target site's status, headers and decoded body, so the
     caller's 403/503/raise_for_status/XML checks work unchanged. A failure of the Zyte call itself
@@ -1121,7 +1128,13 @@ def zyte_get(url: str, headers: dict, session_init_url: Optional[str] = None) ->
         host = urlparse(url).hostname or ''
         for reopen in (False, True):
             session_id = _zyte_session_for(host, session_init_url, reopen=reopen)
-            response = _zyte_plain(url, headers, session_id)
+            try:
+                response = _zyte_plain(url, headers, session_id)
+            except ZyteSessionExpired:
+                if reopen:
+                    raise
+                LOGGER.info(f"Zyte session for {host} expired; opening a new one")
+                continue
             if not is_bot_challenge(response):
                 break
         return response
@@ -1166,6 +1179,8 @@ def _zyte_plain(url: str, headers: dict, session_id: Optional[str] = None) -> re
         # Zyte could not get a ban-free response either: the site is blocked for us, full stop.
         # No retries (each attempt is a minute or more of Zyte's own effort); classifies 'blocked'.
         raise ZyteBan(f"Zyte website ban (blocked) for {url}: {api_response.text[:200]}")
+    if session_id and api_response.status_code == 422 and 'expired' in api_response.text.lower():
+        raise ZyteSessionExpired(f"Zyte API 422 for {url}: {api_response.text[:300]}")
     if api_response.status_code != 200:
         detail = api_response.text[:300]
         raise requests.exceptions.ConnectionError(f"Zyte API {api_response.status_code} for {url}: {detail}")
