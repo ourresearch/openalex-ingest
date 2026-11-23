@@ -45,6 +45,16 @@ EU_REPO_TYPE = {
     "AcademicMonograph": "info:eu-repo/semantics/book",
     "ReportResearch": "info:eu-repo/semantics/report",
     "ReportWorkingPaper": "info:eu-repo/semantics/workingPaper",
+    # the non-thesis written types (endpoint nva_sikt_non_thesis); types with no clear info:eu-repo term (letters,
+    # editorials, book reviews, encyclopedia entries, conference abstracts ...) keep only the NVA type for the classifier
+    "ProfessionalArticle": "info:eu-repo/semantics/article",
+    "PopularScienceArticle": "info:eu-repo/semantics/contributionToPeriodical",
+    **dict.fromkeys(("BookAnthology", "NonFictionMonograph", "Textbook", "PopularScienceMonograph", "Encyclopedia",
+                     "ExhibitionCatalog"), "info:eu-repo/semantics/book"),
+    **dict.fromkeys(("NonFictionChapter", "PopularScienceChapter", "TextbookChapter", "ExhibitionCatalogChapter",
+                     "Introduction", "ChapterInReport"), "info:eu-repo/semantics/bookPart"),
+    **dict.fromkeys(("ReportBasic", "ReportPolicy", "ConferenceReport", "ReportBookOfAbstract"),
+                    "info:eu-repo/semantics/report"),
 }
 # Who wrote it: the Creator role; an artistic doctorate may name its candidate as Artist. Supervisors never.
 AUTHOR_ROLES = ("Creator", "Artist")
@@ -180,6 +190,21 @@ def to_oai_record(hit, stamp=None):
     return ET.tostring(rec, encoding="unicode")
 
 
+def _page_size(url, params):
+    """The page size a request asks for: in params for the first page, in the URL of NVA's next-page links."""
+    if params is not None:
+        return int(params.get("size") or PAGE_SIZE)
+    m = re.search(r"[?&]size=(\d+)", url)
+    return int(m.group(1)) if m else PAGE_SIZE
+
+
+def _resize(url, params, size):
+    """The same request with another page size."""
+    if params is not None:
+        return url, {**params, "size": size}
+    return re.sub(r"([?&]size=)\d+", rf"\g<1>{size}", url), None
+
+
 class NvaRecords:
     """Iterator over one modification-date window, the stand-in for sickle's ListRecords result in
     EndpointHarvester.call_pmh_endpoint. The first page is read here, so an empty window raises NoRecordsMatch and
@@ -189,6 +214,7 @@ class NvaRecords:
 
     def __init__(self, types, first=None, last=None, deadline=None, deadline_error=TimeoutError, session=None,
                  page_size=PAGE_SIZE):
+        self.page_size = page_size
         params = {"instanceType": types, "aggregation": "none", "size": page_size, "sort": "modified_date:asc"}
         if first is not None:  # None = first harvest: the whole feed
             params["modified_since"] = first.isoformat()
@@ -206,10 +232,19 @@ class NvaRecords:
     def _left(self):
         return None if self.deadline is None else self.deadline - time()
 
+    def _pause(self, seconds):
+        """Sleep, but never past the deadline."""
+        sleep(seconds if (left := self._left()) is None else max(0, min(seconds, left)))
+
     def _get(self, url, params):
-        for attempt in range(self.ATTEMPTS):
+        """One page. NVA answers HTTP 500 to some pages of 100 every time, though the same hits pass in pages of 50
+        (23 Nov 2026: AcademicArticle and JournalCorrigendum pages), so a second 500 in a row halves the page instead of
+        asking for the same one again; _walk grows the next pages back. A page that fails even at size 1 ends the run."""
+        attempt, prev500 = 0, False
+        while attempt < self.ATTEMPTS:
             if (left := self._left()) is not None and left <= 0:
                 raise self.deadline_error("NVA search: deadline reached")
+            is500 = False
             try:
                 r = self.http.get(url, params=params, timeout=(30, 120))
                 if r.status_code == 200:
@@ -217,12 +252,22 @@ class NvaRecords:
                 err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code < 500 and r.status_code != 429:
                     raise requests.exceptions.HTTPError(err, response=r)
+                is500 = r.status_code == 500
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 err = repr(e)
-            if attempt + 1 < self.ATTEMPTS:
-                LOGGER.warning(f"NVA search retry {attempt + 1}: {err}")
-                wait = 5 * 2 ** attempt
-                sleep(wait if (left := self._left()) is None else max(0, min(wait, left)))
+            if is500 and (size := _page_size(url, params)) > 1:  # not an attempt: retry once, then halve
+                if prev500:
+                    LOGGER.warning(f"NVA search: HTTP 500 twice at page size {size}; trying {size // 2}")
+                    url, params = _resize(url, params, size // 2)
+                else:
+                    self._pause(5)
+                prev500 = not prev500
+                continue
+            prev500 = False
+            attempt += 1
+            if attempt < self.ATTEMPTS:
+                LOGGER.warning(f"NVA search retry {attempt}: {err}")
+                self._pause(5 * 2 ** (attempt - 1))
         raise requests.exceptions.ConnectionError(f"NVA search: gave up after {self.ATTEMPTS} attempts: {err}")
 
     def _walk(self):
@@ -240,6 +285,8 @@ class NvaRecords:
             nxt = page.get("nextSearchAfterResults")
             if not page.get("hits") or not nxt:
                 return
+            if (size := _page_size(nxt, None)) < self.page_size:  # back up after a shrunk page
+                nxt = _resize(nxt, None, min(self.page_size, size * 2))[0]
             page = self._get(nxt, None)
 
     def __iter__(self):

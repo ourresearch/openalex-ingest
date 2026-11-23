@@ -178,7 +178,7 @@ def s3_folder(endpoint):
     return f"{PREFIX_S3_FOLDER.get(endpoint.metadata_prefix, 'repositories')}/{endpoint.id}"
 # Endpoints read from NVA's search API instead of their OAI feed, whose oai_dc names supervisors as contributors and
 # no author (nva.py, oxjob #2380). pmh_set holds the NVA instance types; records land as oai_dc under repositories/.
-NVA_SEARCH_ENDPOINTS = {"nva_sikt"}
+NVA_SEARCH_ENDPOINTS = {"nva_sikt", "nva_sikt_non_thesis"}
 # Smaller S3 batches where records are big: the buffer holds parsed records, and a HAL TEI record is
 # ~26 KB of XML (oxjob #1588).
 BATCH_SIZE_BY_ENDPOINT = {"hal_tei": 1000}

@@ -3,6 +3,7 @@ from datetime import date
 import xml.etree.ElementTree as ET
 
 import pytest
+import requests
 
 import nva
 
@@ -148,7 +149,8 @@ class FakeSession:
 
     def get(self, url, params=None, timeout=None):
         self.calls.append((url, params))
-        return FakeResponse(self.pages.pop(0))
+        page = self.pages.pop(0)
+        return FakeResponse(*page) if isinstance(page, tuple) else FakeResponse(page)
 
 
 def test_window_pages_by_search_after():
@@ -209,3 +211,39 @@ def test_no_file_link_without_an_open_unembargoed_pdf():
     later = date.today().replace(year=date.today().year + 1).isoformat() + "T00:00:00Z"
     for files in ([], [_file("v", mime="video/mp4")], [_file("e", embargoDate=later)]):
         assert not any("filelink" in i for i in parse(hit(associatedArtifacts=files))[1]["identifier"])
+
+
+def test_a_page_nva_answers_500_twice_is_halved_then_grows_back(monkeypatch):
+    """NVA 500s some pages of 100 every time while the same hits pass at 50 (oxjob #2380, 23 Nov 2026)."""
+    monkeypatch.setattr(nva, "sleep", lambda s: None)
+    s = FakeSession([{"totalHits": 3, "hits": [hit()],
+                      "nextSearchAfterResults": "https://api.nva.unit.no/search/resources?size=100&search_after=1%2Ca"},
+                     ({}, 500), ({}, 500),
+                     {"hits": [hit(id="https://api.nva.unit.no/publication/b")],
+                      "nextSearchAfterResults": "https://api.nva.unit.no/search/resources?size=50&search_after=2%2Cb"},
+                     {"hits": [hit(id="https://api.nva.unit.no/publication/c")], "nextSearchAfterResults": None}])
+    ids = [r.header.identifier for r in nva.NvaRecords("AcademicArticle", session=s)]
+    assert ids[-2:] == ["https://api.nva.unit.no/publication/b", "https://api.nva.unit.no/publication/c"]
+    sizes = [nva._page_size(url, params) for url, params in s.calls]
+    assert sizes == [100, 100, 100, 50, 100]
+    assert "search_after=1%2Ca" in s.calls[3][0]
+
+
+def test_a_page_that_fails_at_every_size_ends_the_run(monkeypatch):
+    monkeypatch.setattr(nva, "sleep", lambda s: None)
+    s = FakeSession([({}, 500)] * 40)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        nva.NvaRecords("AcademicArticle", session=s)
+    assert nva._page_size(*s.calls[-1]) == 1
+
+
+def test_non_thesis_types_carry_an_eu_repo_type_where_one_fits():
+    for nva_type, eu in [("BookAnthology", "book"), ("NonFictionChapter", "bookPart"), ("ReportBasic", "report"),
+                         ("ProfessionalArticle", "article")]:
+        h = hit()
+        h["entityDescription"]["reference"]["publicationInstance"]["type"] = nva_type
+        types = [e.text for e in ET.fromstring(nva.nva_record(h).raw).findall(f".//{DC}type")]
+        assert types == [f"info:eu-repo/semantics/{eu}", nva_type]
+    h = hit()
+    h["entityDescription"]["reference"]["publicationInstance"]["type"] = "JournalLetter"
+    assert [e.text for e in ET.fromstring(nva.nva_record(h).raw).findall(f".//{DC}type")] == ["JournalLetter"]
