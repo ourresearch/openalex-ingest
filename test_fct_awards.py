@@ -29,7 +29,9 @@ def person(pid, name, orcid=None, ciencia=None):
 
 
 def record(pid, ref, title='Título', funder='<Acronym>FCT</Acronym><Name>Fundação para a Ciência e a Tecnologia</Name>'
-           '<RORID>https://ror.org/00snfqn58</RORID>', program='PTDC', pi=None, members=(), amount='1000', streams=()):
+           '<RORID>https://ror.org/00snfqn58</RORID>', program='PTDC', pi=None, members=(), amount='1000', streams=(),
+           subjects='', comment='<!--<Subject scheme="https://w3id.org/cerif/model#ResultPublication_Classification" xml:lang="pt">'
+           'Matemática</Subject>-->', extension=''):
     team = ''
     if pi:
         team += f'<PrincipalInvestigator>{person(*pi)}</PrincipalInvestigator><Contact>{person(*pi)}</Contact>'
@@ -45,7 +47,31 @@ def record(pid, ref, title='Título', funder='<Acronym>FCT</Acronym><Name>Funda�
             f'<Amount currency="EUR">{amount}</Amount></Funding></As></Funded>'
             + ''.join(f'<Funded><By><OrgUnit id="9"><Name>UE</Name></OrgUnit></By><As><Funding id="{pid}B">'
                       f'<Amount currency="{cur}">{v}</Amount></Funding></As></Funded>' for cur, v in streams)
-            + f'<!--<Subject scheme="x" xml:lang="pt">Matemática</Subject>--></Project></metadata></record></ListRecords></OAI-PMH>').encode()
+            + f'{comment}{subjects}</Project></metadata>{extension}</record></ListRecords></OAI-PMH>').encode()
+
+
+CLS = 'https://w3id.org/cerif/model#ResultPublication_Classification'
+
+
+def subject(text, lang='pt', scheme=CLS, label=None):
+    return (f'<Subject' + (f' label="{label}"' if label else '') + f' scheme="{scheme}"'
+            + (f' xml:lang="{lang}"' if lang else '') + f'>{text}</Subject>')
+
+
+def legacy(text, lang='pt', scheme=CLS):
+    return f'<!--{subject(text, lang, scheme)}-->'   # FCT's legacy code beside the element ("Fis"); most dropped on 2026-11-18
+
+
+# what FCT added outside <Project> on 2026-11-18: UN SDG tags and OpenAlex topic links, never research areas
+EXTENSION = ('<metadata-extension><Subjects>'
+             + subject('https://metadata.un.org/sdg/14', 'en', 'https://metadata.un.org/sdg', 'Life Below Water')
+             + subject('https://metadata.un.org/sdg/14', 'pt', 'https://metadata.un.org/sdg', 'Proteger a Vida Marinha')
+             + subject('https://openalex.org/14', None, 'https://openalex.org/topics', 'Proteger a Vida Marinha')
+             + '</Subjects></metadata-extension>')
+
+
+def description(**kw):
+    return fct.parse_cerif(record('P', 'PTDC/X/1/2024', pi=('1', 'Ana Lima'), **kw))['description']
 
 
 RECORDS = {
@@ -232,6 +258,42 @@ class FctTest(unittest.TestCase):
                                                                  'Retry(total=3)', 'err', '/services/getFileDump/wYfZsecretTok+1')
         self.assertNotIn('secretTok', ''.join(logs.output))
         self.assertIn('getFileDump/***', ''.join(logs.output))
+
+    def test_published_research_area_in_portuguese(self):
+        pt = (subject('Ciências Naturais/Física') + subject(' Ciências  Naturais/Física ') + subject('') + subject('n/a')
+              + subject('Matemática') + subject('Natural Sciences/Physical Sciences', 'en'))
+        self.assertEqual(description(subjects=pt, comment=''), 'Ciências Naturais/Física; Matemática')   # cleaned, deduped
+
+    def test_a_record_with_only_comments_takes_them_by_the_same_rule(self):
+        self.assertEqual(description(), 'Matemática')
+        old = (legacy('Ciências Naturais e do Ambiente') + legacy('Natural and Environmental Sciences', 'en')
+               + legacy('Ciências Agrárias') + legacy('Ciências Agrárias'))
+        self.assertEqual(description(comment=old), 'Ciências Naturais e do Ambiente; Ciências Agrárias')   # pt, deduped
+        self.assertEqual(description(comment=legacy('Civil Engineering', 'en')), 'Civil Engineering')        # else en
+        self.assertIsNone(description(comment=legacy('https://metadata.un.org/sdg/9', 'pt', 'https://metadata.un.org/sdg')))
+        self.assertIsNone(description(comment=''))
+
+    def test_published_research_area_wins_over_the_comment(self):
+        both = subject('Ciências Naturais/Química') + subject('Natural Sciences/Chemical Sciences', 'en')
+        self.assertEqual(description(comment=legacy('Ciências Exatas/Química'), subjects=both), 'Ciências Naturais/Química')
+
+    def test_published_english_when_no_portuguese(self):
+        en = subject('Natural Sciences/Physical Sciences', 'en') + subject('', 'pt')
+        self.assertEqual(description(comment=legacy('Fis'), subjects=en), 'Natural Sciences/Physical Sciences')
+
+    def test_sdg_and_openalex_topics_are_never_a_research_area(self):
+        self.assertEqual(description(comment=legacy('Fis'), extension=EXTENSION), 'Fis')   # falls back to the comment
+        self.assertIsNone(description(comment='', extension=EXTENSION))
+        self.assertEqual(description(comment=legacy('Fis'), subjects=subject('Ciências Naturais/Física'), extension=EXTENSION),
+                         'Ciências Naturais/Física')
+
+    def test_other_schemes_inside_project_are_ignored(self):
+        other = (subject('Oceanografia', 'pt', 'https://w3id.org/cerif/vocab/Keywords') + '<Subject xml:lang="pt">Oceanografia</Subject>'
+                 + subject('https://openalex.org/14', 'pt', 'https://openalex.org/topics')
+                 + subject('https://metadata.un.org/sdg/14', 'pt', 'https://metadata.un.org/sdg'))
+        self.assertEqual(description(comment=legacy('Fis'), subjects=other), 'Fis')
+        self.assertEqual(description(comment=legacy('Fis'), subjects=other + subject('Ciências Naturais/Física')),
+                         'Ciências Naturais/Física')
 
     def test_prefix(self):
         self.assertEqual(fct.API, 'https://api.ptcris.pt/services/searches/projects/dump')

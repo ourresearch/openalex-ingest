@@ -12,6 +12,9 @@ decided 11-05 (Rohan, via grants-hub: "as published, no fill-ins"):
   - amount is the project total: the sum of the record's <Funded> streams (e.g. FCT's national share + FEDER co-funding),
     where the laptop took the first stream only; a stream in any currency but EUR fails the run;
   - the frozen 2026-06 fct.pt XLSX list (its URL 404s) is no longer merged in.
+description (the research area) is the field-of-science <Subject> FCT publishes in <Project> (pt, else en), and a
+commented-out one only when a record has none. The laptop read only the comments, a legacy code beside the element
+("Fis", "Psic"); FCT's 2026-11-18 dump dropped them from 29,681 records, which blanked their research area.
 Added: pi_orcid, pi_ciencia_id, team_json (the project's team members, in SciPROJ's order, without the PI), sciproj_id,
 source_dump, ingested_at.
 Never read or written: e-mail addresses, birth dates, gender, country codes of people (the private dump holds them).
@@ -67,7 +70,9 @@ _COUNTRY = {
     "pl": "Poland", "polónia": "Poland",
     "gr": "Greece", "grécia": "Greece",
 }
-_SUBJECT_COMMENT = re.compile(r"<!--<Subject[^>]*>([^<]+)</Subject>-->")
+_SUBJECT_COMMENT = re.compile(r"<!--<Subject([^>]*)>([^<]+)</Subject>-->")
+_ATTR = re.compile(r'([\w:]+)="([^"]*)"')
+_CLASSIFICATION = "#ResultPublication_Classification"   # FCT's field-of-science scheme; SDG and OpenAlex topics are other schemes
 _ORCID = re.compile(r"(\d{4}-\d{4}-\d{4}-\d{3}[\dX])$", re.I)
 _DUMP_ENTRY = re.compile(r'<dump-file\s+name="([^"]+)"\s*>\s*([^<\s]+)\s*</dump-file>')
 _TOKEN = re.compile(r"(getFileDump/)[^\s'\"?&]+")
@@ -234,8 +239,14 @@ def parse_cerif(xml_bytes):
         inst_country = norm_country(coord.findtext("c:Country", default=None, namespaces=NS))
     pi = proj.find(".//c:Team/c:PrincipalInvestigator/c:Person/c:PersonName", NS)
     pf, pg, pfam = split_pi(pi.text if pi is not None else None)
-    subjects = [clean(s) for s in _SUBJECT_COMMENT.findall(xml_bytes.decode("utf-8", "replace"))]
-    description = "; ".join(dict.fromkeys(s for s in subjects if s)) or None
+    # Changed: the research area FCT publishes in <Project>, else a commented-out one; field-of-science scheme only, pt else en.
+    published = [((s.get("scheme") or ""), s.get("{http://www.w3.org/XML/1998/namespace}lang"), clean(s.text))
+                 for s in proj.findall("c:Subject", NS)]
+    commented = [(a.get("scheme", ""), a.get("xml:lang"), clean(text)) for a, text in
+                 ((dict(_ATTR.findall(attrs)), text) for attrs, text in _SUBJECT_COMMENT.findall(xml_bytes.decode("utf-8", "replace")))]
+    subjects = next((found for found in ([v for scheme, l, v in form if scheme.endswith(_CLASSIFICATION) and l == lang and v]
+                                         for form in (published, commented) for lang in ("pt", "en")) if found), [])
+    description = "; ".join(dict.fromkeys(subjects)) or None
     start = clean(proj.findtext("c:StartDate", default=None, namespaces=NS))
     end = clean(proj.findtext("c:EndDate", default=None, namespaces=NS))
     start = start if start and re.match(r"^(19|20)\d{2}-", start) else None

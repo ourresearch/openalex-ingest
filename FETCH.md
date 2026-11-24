@@ -133,6 +133,10 @@ record with walden's laptop parser (scripts/local/fct_to_s3.py) ported, with two
 amount is the project total, the sum of the record's <Funded> streams (FCT's national share + FEDER co-funding; 6,618 records have
 2-5 streams), where the laptop took the first stream; a stream in any currency but EUR fails the run. And the frozen 2026-06 fct.pt
 XLSX list (its URL 404s) is no longer merged in.
+description (the research area) is the field-of-science <Subject> FCT publishes in <Project>, else a commented-out one; pt, else
+en; UN SDG and OpenAlex-topic subjects are never read. Until 2026-11 the parser read only the comments, a legacy code beside the
+element ("Fis", "Psic"); FCT's 2026-11-18 dump dropped them from 29,681 records. Measured on the 11-04, 11-11 and 11-18 dumps:
+fill 92.7%, 90.3%, 92.6% (comments only: 91.8%, 58.9%, 64.3%); about 90K served descriptions change once to FCT's field names.
 Added: pi_orcid, pi_ciencia_id, team_json (members in SciPROJ's order, PI and repeats left out), sciproj_id, source_dump.
 E-mail addresses, birth dates, gender and people's country codes in the private dump are never read into the output.
 Refuses upload below 100,000 rows, or when under 85% of FCT rows have a PI (a dump without Person, or truncated).
