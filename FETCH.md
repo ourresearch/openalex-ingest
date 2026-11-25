@@ -157,6 +157,11 @@ awards/kaken/ keeps the 2026-07-08 page scrape (kaken_projects.parquet) that wal
 the row at awards/kaken_api/; a manual fetch therefore changes nothing served until that push, and the gate runs in between.
 members_json carries every project member in KAKEN's order (role code, family/given name, researcher number, e-Rad code,
 affiliation, institution NII code); walden maps co_investigator_buntan / co_investigator_renkei to investigators.
+products_json (one object per reported output, all values strings) also keeps, since oxjob #2632: authors, volume, issue, pages,
+total_pages, publisher, isbn, language, date, description (「研究成果報告書概要(欧文)」より marks a line from the English summary),
+report (the parent report id(s): <project><year>jisseki, <project>seika, ...), product_id (KAKEN's PRODUCT-<n>), and doi_original
+(the DOI as typed, only when KAKEN left <doi> empty). Existing keys are unchanged. Measured on 63 grants: products_json +83%;
+the 2026-11-17 object is 1.62 GB, so expect ~2.6-3 GB on the dyno before upload.
 Paging: one OpenSearch query per start fiscal year (o1=1, s1=s2=FY, 1964..this year), 500 per page; KAKEN caps a query at
 200,000 results and the largest start year holds well under that. ~1,120,000 projects is ~2,300 pages at >= 1 s each.
 KAKEN_APPID (the CiNii Web API application id) lives in Heroku config only; the URL that carries it is never logged.

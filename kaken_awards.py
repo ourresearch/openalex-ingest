@@ -253,6 +253,10 @@ def parse_grant_award(ga) -> Optional[dict]:
     # Research products (self-reported grant -> output links). Superset of the
     # scraper's {type,title,year,doi,naid}; all values strings so the junction
     # notebook's array<map<string,string>> parse keeps working.
+    # oxjob #2632 adds what a work record or a bibliographic match needs (KAKEN XML
+    # definition, productList/product): authors, volume, issue, pages, publisher,
+    # ISBN, the report the line comes from, KAKEN's product id, and the DOI as the
+    # grantee typed it when KAKEN left the element empty. Existing keys keep their meaning.
     products = []
     pl_el = ga.find("productList")
     for p in (pl_el.findall("product") if pl_el is not None else []):
@@ -265,6 +269,7 @@ def parse_grant_award(ga) -> Optional[dict]:
         naid, _ = _ident("naid")
         pmid, _ = _ident("pmid")
         issn, _ = _ident("issn")
+        isbn, _ = _ident("isbn")
         prod = {
             "type": p.get("type"),
             "title": _lang_pick(p.findall("title")),
@@ -278,7 +283,26 @@ def parse_grant_award(ga) -> Optional[dict]:
             "reviewed": p.get("reviewed"),
             "open_access": p.get("openAccess"),
             "acknowledgement": p.get("acknowledgement"),
+            "product_id": p.get("id"),
+            "report": ",".join(r.get("id") for r in p.findall("parent") if r.get("id")) or None,
+            "authors": _lang_pick(p.findall("author")),
+            "volume": _txt(p, "volume"),
+            "issue": _txt(p, "issue"),
+            "pages": _txt(p, "pages"),
+            "total_pages": _txt(p, "totalPages"),
+            "publisher": _lang_pick(p.findall("publisher")),
+            "isbn": isbn,
+            "language": _txt(p, "language"),
+            "date": _txt(p, "date"),
+            # e.g. 「研究成果報告書概要(欧文)」より: the line comes from the English summary (often a translated title)
+            "description": _txt(p, "description"),
         }
+        if not doi:
+            # KAKEN leaves <doi> empty when it could not normalise what the grantee typed
+            # (originalValue "DOI:10.1002/...", or "なし" for none); keep a DOI-looking value apart from doi
+            orig = next((el.get("originalValue") for el in p.findall("doi") if el.get("originalValue")), None)
+            if orig and re.search(r"10\.\d{4,}/", orig):
+                prod["doi_original"] = orig.strip()
         if not doi and p.get("id") in enriched_doi:
             prod["enriched_doi"] = enriched_doi[p.get("id")]
         if any(prod.get(k) for k in ("title", "doi", "naid", "pmid")):
