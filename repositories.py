@@ -106,6 +106,8 @@ REQUEST_TIMEOUT = 30        # Connect timeout (seconds); Python counts the TLS h
 READ_TIMEOUT = 60
 # (connect, read) timeouts for hosts that answer slower than READ_TIMEOUT, keyed by a piece of the OAI URL.
 TIMEOUT_BY_URL_PART = {
+    # OCLC CONTENTdm: a dated ListRecords takes ~110 s (cdm16084, 25 Nov 2026, oxjob #2626)
+    'contentdm.oclc.org': (30, 300),
     'osti.gov/oai': (30, 300),
     'irdb.nii.ac.jp': (120, 600),
     # Engineering Transactions: ~100 s per OAI response from the harvester (oxjob #1407/#1417)
