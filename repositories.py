@@ -122,6 +122,12 @@ TIMEOUT_BY_URL_PART = {
 # recovered on retry, and an end-of-run pass over the still-blocked rows cost ~4.5 min each
 # (~70 h for 942), so the pass is off by default; --retry-blocked-threads N turns it on.
 BLOCKED_RETRY_WAITS = (30,)
+# no 'Harvester' in the name: bad-bot filters read it as an email harvester (oxjob #2348, 117 of 143 blocking sites)
+USER_AGENT = 'OpenAlex/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'
+# A dated ListRecords failing with one of these, while the same request without dates answers, means the server can't
+# filter by date (oxjob #2626): the run walks the feed undated and keeps what's new. Not timeouts: those servers are slow,
+# not refusing (CONTENTdm answered a dated request in 110 s; walking it undated took 25 min for 3 new records of 50,199).
+DATE_REFUSAL_ERRORS = (requests.exceptions.HTTPError, oaiexceptions.BadArgument)
 SLOW_HOST_INTERVAL = 3.0
 SLOW_HOST_MAX_INTERVAL = 15.0
 RETRY_BLOCKED_WORKERS = 0
@@ -646,6 +652,7 @@ class EndpointHarvester:
         # iterable"), every other day in Nov 2026.
         undated = []
         undated_key = (last or datetime.now(timezone.utc).date()).isoformat()
+        keep_from, skipped_old = None, 0  # set when the server refuses date filters (oxjob #2626)
 
         try:
             if self.state.id in NVA_SEARCH_ENDPOINTS:
@@ -657,7 +664,19 @@ class EndpointHarvester:
                                            fetch_via_zyte=bool(self.state.fetch_via_zyte),
                                            on_zyte_adopted=self._adopt_zyte)
                 my_sickle.deadline = deadline  # MySickle stops retrying/sleeping past it
-                records = self._make_oai_request(my_sickle, **args)
+                try:
+                    records = self._make_oai_request(my_sickle, **args)
+                except DATE_REFUSAL_ERRORS:
+                    # oxjob #2626: some servers refuse any 'from' or 'until' (many OJS: 500; some: 403) yet serve the
+                    # same list undated. Walk it undated, keep records dated from 'first' on, and checkpoint only when
+                    # the walk completes (an undated walk is in no date order).
+                    no_dates = {k: v for k, v in args.items() if k not in ('from', 'until')}
+                    if first_harvest or not self._answers_without_dates(my_sickle, no_dates):
+                        raise
+                    self.logger.warning(f"{self.state.pmh_url} refuses date filters: walking it undated, "
+                                        f"keeping records dated {first} or later")
+                    args, keep_from, in_order = no_dates, first.isoformat(), False
+                    records = self._make_oai_request(my_sickle, **args)
 
                 if hasattr(records._items, 'oai_response'):
                     resumption_token_element = records._items.oai_response.xml.find(
@@ -667,6 +686,8 @@ class EndpointHarvester:
                         if complete_list_size:
                             self.metrics.total_records = int(complete_list_size)
                             self.logger.info(f"Total records to harvest: {self.metrics.total_records}")
+                if keep_from:
+                    self.metrics.total_records = None  # the whole list's size, not what this window keeps
 
             # Group records by date
             records_by_date = {}
@@ -677,6 +698,9 @@ class EndpointHarvester:
             records_set_aside = 0
 
             for record in self._iter_records_safe(records):
+                if keep_from and (record.header.datestamp or '9999')[:10] < keep_from:
+                    skipped_old += 1
+                    continue
                 self.metrics.increment_count()
                 self.metrics.update_datestamp(record.header.datestamp)
 
@@ -772,6 +796,9 @@ class EndpointHarvester:
                 records_saved += len(undated)
                 self.save_batch(s3_client, s3_bucket, 1, undated, undated_key)
                 self.logger.warning(f"Saved {len(undated)} record(s) with no datestamp under {undated_key}")
+
+            if keep_from:
+                self.logger.info(f"Undated walk: kept {self.metrics.record_count}, skipped {skipped_old} dated before {keep_from}")
 
             # Reconcile: record_count counts records ITERATED, which is what made the drop
             # above invisible for as long as it existed. Compare against what we actually
@@ -1009,6 +1036,18 @@ class EndpointHarvester:
         before=tenacity.before_log(LOGGER, logging.INFO),
         after=tenacity.after_log(LOGGER, logging.INFO)
     )
+    def _answers_without_dates(self, sickle, params):
+        """One ListRecords request without from/until and without retries: does the feed answer it? (oxjob #2626)"""
+        url = f"{sickle.endpoint}?" + "&".join(f"{k}={v}" for k, v in dict(verb='ListRecords', **params).items())
+        try:
+            if sickle.fetch_via_zyte and zyte_available():
+                r = zyte_get(url, {'User-Agent': USER_AGENT})
+            else:
+                r = _tls_tolerant_request('get', url, headers={'User-Agent': USER_AGENT}, **sickle.request_args)
+        except Exception:  # noqa: BLE001 - any failure means "no": the dated error stands
+            return False
+        return r.status_code == 200 and b'<OAI-PMH' in (r.content or b'')[:20000]
+
     def _make_oai_request(self, sickle, **kwargs):
         """Wrapper for OAI-PMH requests with retry logic"""
         return sickle.ListRecords(**kwargs)
@@ -1289,8 +1328,7 @@ class MySickle(Sickle):
         LOGGER.warning(f"Stripped {blocks} PHP notice(s) before the XML declaration from {self.endpoint}")
 
     def harvest(self, **kwargs):
-        # no 'Harvester' in the name: bad-bot filters read it as an email harvester (oxjob #2348, 117 of 143 blocking sites)
-        headers = {'User-Agent': 'OpenAlex/1.0 (+https://help.openalex.org/how-to/repositories/; mailto:support@openalex.org)'}
+        headers = {'User-Agent': USER_AGENT}
         retry_wait = self.DEFAULT_RETRY_SECONDS
         attempt = 0
         blocked_attempts = 0

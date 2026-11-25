@@ -187,5 +187,82 @@ class SlowHostTimeouts(unittest.TestCase):
         self.assertEqual(self.sent_timeout("https://repo.example.org/oai"), (R.REQUEST_TIMEOUT, R.READ_TIMEOUT))
 
 
+def run_refusing_dates(feed, checkpoint, answers_undated=True, first=date(2026, 11, 5), last=date(2026, 11, 8)):
+    """Like run(), on a server that answers 500 to any request carrying 'from' (oxjob #2626)."""
+    state = SimpleNamespace(id="test-endpoint", pmh_url="https://example.org/oai", pmh_set=None,
+                            metadata_prefix="oai_dc", most_recent_date_harvested=checkpoint,
+                            fetch_via_zyte=False, error=None)
+    saved, calls = [], []
+
+    def request(self, sickle, **kw):
+        calls.append(kw)
+        if 'from' in kw:
+            raise R.requests.exceptions.HTTPError("500 Server Error", response=SimpleNamespace(status_code=500))
+        return feed
+
+    def save_batch(self, s3_client, s3_bucket, batch_number, records, date_key, folder=None):
+        saved.extend((date_key, r.header.identifier) for r in records)
+
+    error = None
+    with patch.object(R.EndpointHarvester, "detect_date_format", lambda self: "%Y-%m-%d"), \
+            patch.object(R, "_get_my_sickle", lambda *a, **k: SimpleNamespace(deadline=None)), \
+            patch.object(R.EndpointHarvester, "_make_oai_request", request), \
+            patch.object(R.EndpointHarvester, "_answers_without_dates", lambda self, sickle, params: answers_undated), \
+            patch.object(R.EndpointHarvester, "save_batch", save_batch):
+        h = R.EndpointHarvester(state, FakeDb())
+        try:
+            h.harvest("bucket", first=first, last=last)
+        except Exception as e:  # noqa: BLE001 - the test inspects it
+            error = e
+    return state.most_recent_date_harvested, saved, error, calls
+
+
+# Mersin's feed undated, in identifier order: records from every year, two in the window
+WHOLE_FEED = [rec("old1", "2019-04-02"), rec("new1", "2026-11-07"), rec("old2", "2024-01-15"), rec("new2", "2026-11-05"),
+              rec("old3", "2026-11-04")]
+
+
+class RefusesDateFilters(unittest.TestCase):
+    def test_walks_undated_and_keeps_only_the_window(self):
+        cp, saved, err, calls = run_refusing_dates(FakeFeed(WHOLE_FEED), START)
+        self.assertIsNone(err)
+        self.assertEqual(sorted(i for _, i in saved), ["new1", "new2"])
+        self.assertNotIn('from', calls[-1])
+        self.assertEqual(cp, datetime(2026, 11, 8))  # completed walk: the window's end
+
+    def test_a_server_that_refuses_both_keeps_its_error_and_checkpoint(self):
+        cp, saved, err, calls = run_refusing_dates(FakeFeed(WHOLE_FEED), START, answers_undated=False)
+        self.assertIsInstance(err, R.requests.exceptions.HTTPError)
+        self.assertEqual((cp, saved, len(calls)), (START, [], 1))
+
+    def test_an_undated_walk_that_dies_keeps_the_starting_checkpoint(self):
+        cp, saved, err, _ = run_refusing_dates(FakeFeed(WHOLE_FEED, fail_after=3, fail=R.requests.exceptions.ReadTimeout("x")), START)
+        self.assertIsNotNone(err)
+        self.assertEqual(cp, START)  # in no date order, so no mid-walk checkpoint: the next run re-walks
+
+    def test_a_timeout_is_a_slow_server_not_a_refusal(self):
+        feed = FakeFeed(WHOLE_FEED)
+        with patch.object(R.EndpointHarvester, "_answers_without_dates", lambda self, sickle, params: True):
+            state = SimpleNamespace(id="t", pmh_url="https://example.org/oai", pmh_set=None, metadata_prefix="oai_dc",
+                                    most_recent_date_harvested=START, fetch_via_zyte=False, error=None)
+
+            def request(self, sickle, **kw):
+                if 'from' in kw:
+                    raise R.requests.exceptions.ReadTimeout("read timed out")
+                return feed
+            with patch.object(R.EndpointHarvester, "detect_date_format", lambda self: "%Y-%m-%d"), \
+                    patch.object(R, "_get_my_sickle", lambda *a, **k: SimpleNamespace(deadline=None)), \
+                    patch.object(R.EndpointHarvester, "_make_oai_request", request):
+                with self.assertRaises(R.requests.exceptions.ReadTimeout):
+                    R.EndpointHarvester(state, FakeDb()).harvest("bucket", first=date(2026, 11, 5), last=date(2026, 11, 8))
+        self.assertEqual(state.most_recent_date_harvested, START)
+
+    def test_a_first_harvest_never_needs_it(self):
+        cp, saved, err, calls = run_refusing_dates(FakeFeed(WHOLE_FEED), None, first=None)
+        self.assertIsNone(err)
+        self.assertEqual(len(saved), 5)
+        self.assertEqual(len(calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
