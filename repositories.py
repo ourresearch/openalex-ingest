@@ -175,6 +175,13 @@ OPENAIRE_LIVE_ENDPOINTS = {
     "0e7511e16a13645b5be",  # Aston (perl twin)
 }
 OPENAIRE_TRIAL_FOLDER = "openaire-trial"
+# Feeds whose ListRecords does not reset per-record fields between records (oxjob #2662): a record with no dc:creator
+# or dc:description repeats the previous record's in the same response, while GetRecord for the same identifier is
+# right. Cairn.info did this to ~180K works (book reviews and front matter credited to another paper's author, with its
+# abstract). On these feeds a record whose creator or description list equals the previous record's is fetched again
+# with GetRecord. A list that differs from the previous record's is the record's own (943 of 943 checked against
+# GetRecord); an equal one was carried about half the time (same author on consecutive chapters is common).
+CARRYOVER_ENDPOINTS = {"asswjsx35xuxkrfsyfwn"}  # Cairn.info, oai.cairn.info/oai.php
 
 
 def s3_folder(endpoint):
@@ -542,6 +549,7 @@ class EndpointHarvester:
         self.error = None
         self.metrics = MetricsLogger()
         self.logger = get_thread_logger()
+        self.carryover_refetched = self.carryover_failed = 0  # oxjob #2662
         self.date_format = self.detect_date_format()
 
     def _adopt_zyte(self):
@@ -576,6 +584,26 @@ class EndpointHarvester:
                 )
         finally:
             self.metrics.stop()
+
+    def _refetch_carried(self, sickle, records):
+        """Records of a CARRYOVER_ENDPOINTS feed, each one that may carry the previous record's dc:creator or
+        dc:description replaced by its GetRecord copy (oxjob #2662). The comparison is with the previous record as
+        listed, so every record of a carried run is caught. A failed GetRecord keeps the listed copy, logged."""
+        prev = None
+        for record in records:
+            md = getattr(record, 'metadata', None) or {}
+            cur = (tuple(md.get('creator') or ()), tuple(md.get('description') or ()))
+            suspect = prev is not None and any(c and c == p for c, p in zip(cur, prev))
+            prev = cur
+            if suspect and not record.header.deleted:
+                try:
+                    record = sickle.GetRecord(identifier=record.header.identifier,
+                                              metadataPrefix=self.state.metadata_prefix)
+                    self.carryover_refetched += 1
+                except Exception as e:  # noqa: BLE001 - the listed copy is still the best we have
+                    self.carryover_failed += 1
+                    self.logger.warning(f"GetRecord failed for {record.header.identifier} (carry-over check): {e}")
+            yield record
 
     def _iter_records_safe(self, records):
         """Iterate over OAI records, skipping any that fail to parse.
@@ -699,7 +727,10 @@ class EndpointHarvester:
             records_saved = 0
             records_set_aside = 0
 
-            for record in self._iter_records_safe(records):
+            listed = self._iter_records_safe(records)
+            if self.state.id in CARRYOVER_ENDPOINTS:
+                listed = self._refetch_carried(my_sickle, listed)
+            for record in listed:
                 if keep_from and (record.header.datestamp or '9999')[:10] < keep_from:
                     skipped_old += 1
                     continue
@@ -801,6 +832,9 @@ class EndpointHarvester:
 
             if keep_from:
                 self.logger.info(f"Undated walk: kept {self.metrics.record_count}, skipped {skipped_old} dated before {keep_from}")
+            if self.carryover_refetched or self.carryover_failed:
+                self.logger.info(f"Carry-over check: {self.carryover_refetched} records fetched again with GetRecord, "
+                                 f"{self.carryover_failed} failed (kept as listed) for {self.state.pmh_url}")
 
             # Reconcile: record_count counts records ITERATED, which is what made the drop
             # above invisible for as long as it existed. Compare against what we actually
