@@ -585,24 +585,40 @@ class EndpointHarvester:
         finally:
             self.metrics.stop()
 
+    CARRYOVER_TRIES = 3          # GetRecord attempts per suspect record (oxjob #2662)
+    CARRYOVER_BACKOFF_S = 2.0    # wait before retry n: 2 s, 4 s
+
     def _refetch_carried(self, sickle, records):
         """Records of a CARRYOVER_ENDPOINTS feed, each one that may carry the previous record's dc:creator or
         dc:description replaced by its GetRecord copy (oxjob #2662). The comparison is with the previous record as
-        listed, so every record of a carried run is caught. A failed GetRecord keeps the listed copy, logged."""
+        listed, so every record of a carried run is caught.
+        A deleted record (no metadata) passes through and leaves the comparison as it was: the server may keep its
+        fields across it, so the next record is compared with the last record that had metadata. Empty elements
+        (<dc:description/>, None or blank in sickle's lists) count as no value, so two empty records are not suspect.
+        GetRecord is tried CARRYOVER_TRIES times; a record that still fails keeps the listed copy, logged."""
         prev = None
         for record in records:
+            if record.header.deleted:
+                yield record
+                continue
             md = getattr(record, 'metadata', None) or {}
-            cur = (tuple(md.get('creator') or ()), tuple(md.get('description') or ()))
+            cur = tuple(tuple(v for v in (md.get(f) or ()) if v and v.strip()) for f in ('creator', 'description'))
             suspect = prev is not None and any(c and c == p for c, p in zip(cur, prev))
             prev = cur
-            if suspect and not record.header.deleted:
-                try:
-                    record = sickle.GetRecord(identifier=record.header.identifier,
-                                              metadataPrefix=self.state.metadata_prefix)
-                    self.carryover_refetched += 1
-                except Exception as e:  # noqa: BLE001 - the listed copy is still the best we have
-                    self.carryover_failed += 1
-                    self.logger.warning(f"GetRecord failed for {record.header.identifier} (carry-over check): {e}")
+            if suspect:
+                for attempt in range(self.CARRYOVER_TRIES):
+                    try:
+                        record = sickle.GetRecord(identifier=record.header.identifier,
+                                                  metadataPrefix=self.state.metadata_prefix)
+                        self.carryover_refetched += 1
+                        break
+                    except Exception as e:  # noqa: BLE001 - the listed copy is still the best we have
+                        if attempt + 1 < self.CARRYOVER_TRIES:
+                            sleep(self.CARRYOVER_BACKOFF_S * 2 ** attempt)
+                            continue
+                        self.carryover_failed += 1
+                        self.logger.warning(f"GetRecord failed {self.CARRYOVER_TRIES} times for "
+                                            f"{record.header.identifier} (carry-over check): {e}")
             yield record
 
     def _iter_records_safe(self, records):

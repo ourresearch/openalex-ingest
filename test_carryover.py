@@ -31,12 +31,16 @@ def rec(identifier, creator=(), description=(), deleted=False, source="list"):
 class FakeSickle:
     """GetRecord stand-in: the record's own fields from `truth`; ids in `fail` raise."""
 
-    def __init__(self, truth, fail=()):
+    def __init__(self, truth, fail=(), flaky=None):
         self.truth, self.fail, self.deadline, self.calls = truth, set(fail), None, []
+        self.flaky = dict(flaky or {})  # identifier -> failures before it answers
 
     def GetRecord(self, identifier, metadataPrefix):
         self.calls.append(identifier)
         if identifier in self.fail:
+            raise RuntimeError("timeout")
+        if self.flaky.get(identifier, 0) > 0:
+            self.flaky[identifier] -= 1
             raise RuntimeError("timeout")
         cr, de = self.truth[identifier]
         return rec(identifier, cr, de, source="get")
@@ -92,10 +96,35 @@ class CarryOver(unittest.TestCase):
 
     def test_failed_getrecord_keeps_listed_copy(self):
         sickle = FakeSickle(TRUTH, fail={"0187"})
-        saved, h = run(CAIRN, LISTED, sickle)
+        with patch.object(R.EndpointHarvester, "CARRYOVER_BACKOFF_S", 0):
+            saved, h = run(CAIRN, LISTED, sickle)
         by_id = {r.header.identifier: r for r in saved}
         self.assertEqual(by_id["0187"].source, "list")
         self.assertEqual((h.carryover_refetched, h.carryover_failed), (3, 1))
+
+    def test_deleted_record_keeps_the_comparison(self):
+        # the server may keep its fields across a deleted record: 0192 repeats 0191's abstract after it
+        listed = [rec("0191", ["Other"], ["Own abstract"]), rec("0190", [], [], deleted=True),
+                  rec("0192", [], ["Own abstract"])]
+        sickle = FakeSickle({"0192": ([], [])})
+        saved, h = run(CAIRN, listed, sickle)
+        self.assertEqual(sickle.calls, ["0192"])
+        self.assertEqual({r.header.identifier: r.source for r in saved}, {"0191": "list", "0190": "list", "0192": "get"})
+
+    def test_empty_elements_are_no_value(self):
+        listed = [rec("0001", ["A"], [None]), rec("0002", ["B"], [None]), rec("0003", ["C"], ["  "])]
+        sickle = FakeSickle({})
+        run(CAIRN, listed, sickle)
+        self.assertEqual(sickle.calls, [])
+
+    def test_getrecord_retried_before_keeping_listed_copy(self):
+        sickle = FakeSickle(TRUTH, flaky={"0187": 2})
+        with patch.object(R.EndpointHarvester, "CARRYOVER_BACKOFF_S", 0):
+            saved, h = run(CAIRN, LISTED, sickle)
+        by_id = {r.header.identifier: r for r in saved}
+        self.assertEqual(sickle.calls.count("0187"), 3)
+        self.assertEqual(by_id["0187"].source, "get")
+        self.assertEqual((h.carryover_refetched, h.carryover_failed), (4, 0))
 
     def test_other_endpoints_untouched(self):
         sickle = FakeSickle(TRUTH)
