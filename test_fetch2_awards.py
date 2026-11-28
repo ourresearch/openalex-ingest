@@ -131,6 +131,41 @@ class Fetch2Tests(unittest.TestCase):
             with patch.object(kaken,'download',short),self.assertRaisesRegex(ValueError,'truncated'):
                 kaken.build(Path(tmp))
 
+    def test_kaken_products_keep_authors_volume_pages_and_typed_doi(self):
+        # oxjob #2632: the fields a work record or a volume+page match needs, all strings (walden parses
+        # products_json as array<map<string,string>>); existing keys unchanged
+        xml='''<?xml version="1.0"?><results totalResults="1"><grantAward awardNumber="22590893">
+<summary xml:lang="en"><title>Research title</title></summary>
+<productList>
+<product id="PRODUCT-1" type="journal_article" sequence="1" reviewed="true"><parent id="22590893seika"/>
+<doi originalValue="DOI:10.1002/art.30183">10.1002/art.30183</doi><author>Tada Y, Kondo S, 他5名</author>
+<title>Interferon regulatory factor 5</title><journalTitle>Arthritis Rheum</journalTitle><volume>63</volume><issue>3</issue>
+<pages originalValue="738-748">738-748</pages><year originalValue="2011">2011</year></product>
+<product id="PRODUCT-2" type="journal_article" sequence="2"><parent id="225908932010jisseki"/><parent id="225908932011jisseki"/>
+<doi originalValue="doi: 10.1016/j.example.2011.01.001" authenticated="false"/><author>Tada Y</author>
+<title>A second paper</title><year>2011</year><description>「研究成果報告書概要(欧文)」より</description></product>
+<product id="PRODUCT-3" type="book" sequence="3"><doi originalValue="なし" authenticated="false"/><author>Editor A</author>
+<title>A book</title><publisher>Publisher P</publisher><isbn>9784000000000</isbn><totalPages originalValue="105">105</totalPages><year>2012</year></product>
+</productList></grantAward></results>'''
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'page.xml';p.write_text(xml)
+            total,rows=kaken.parse_page(p)
+        prods=json.loads(rows[0]['products_json'])
+        self.assertTrue(all(isinstance(v,str) for x in prods for v in x.values()))
+        a,b,c=prods
+        self.assertEqual((a['doi'],a['authors'],a['volume'],a['issue'],a['pages'],a['report'],a['product_id']),
+                         ('10.1002/art.30183','Tada Y, Kondo S, 他5名','63','3','738-748','22590893seika','PRODUCT-1'))
+        self.assertNotIn('doi_original',a)                       # only when KAKEN left <doi> empty
+        self.assertNotIn('doi',b)                                # doi keeps its meaning: KAKEN's normalised value
+        self.assertEqual(b['doi_original'],'doi: 10.1016/j.example.2011.01.001')
+        self.assertEqual(b['report'],'225908932010jisseki,225908932011jisseki')
+        self.assertEqual(b['description'],'「研究成果報告書概要(欧文)」より')
+        self.assertNotIn('doi_original',c)                       # なし is not a DOI
+        self.assertEqual((c['publisher'],c['isbn'],c['total_pages']),('Publisher P','9784000000000','105'))
+        self.assertEqual(set(a)-{'product_id','report','authors','volume','issue','pages','total_pages','publisher','isbn',
+                                 'language','date','description','doi_original'},
+                         {'type','title','year','doi','journal_title','reviewed'})
+
     def test_kaken_appid_never_reaches_a_log_record(self):
         secret='appid-'+os.urandom(8).hex()
         import logging
